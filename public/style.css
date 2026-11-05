@@ -48,3 +48,4 @@ dialog.termdlg{width:min(1100px,97vw)}
 .logs{min-height:50vh}
 textarea.editor{width:100%;min-height:55vh;font:13px/1.45 ui-monospace,Consolas,monospace;white-space:pre;tab-size:4}
 .card.drop{outline:2px dashed var(--pri);outline-offset:-4px}
+td .row.wrap{flex-wrap:wrap;max-width:360px}

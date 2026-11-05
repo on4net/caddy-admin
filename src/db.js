@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   expires_at TEXT,
   last_used_at TEXT
 );
+CREATE TABLE IF NOT EXISTS registries (
+  id INTEGER PRIMARY KEY,
+  server TEXT NOT NULL UNIQUE,      -- host[:port], e.g. docker.can4net.com
+  username TEXT NOT NULL,
+  password_enc TEXT NOT NULL,       -- AES-GCM, see secrets.js
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY,
   user_id INTEGER,

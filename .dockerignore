@@ -6,3 +6,6 @@ data
 test
 *.md
 scripts
+caddy_data
+caddy_config
+panel_data

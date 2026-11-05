@@ -368,7 +368,7 @@ async function monitorPage(main) {
 
 // ======================= Docker =======================
 async function dockerPage(main) {
-  const tabs = ['containers', 'images', 'volumes', 'networks'];
+  const tabs = ['containers', 'images', 'volumes', 'networks', 'registries'];
   let info;
   try { info = await api('GET', '/docker/info'); }
   catch (e) { return main.replaceChildren(h('div', { class: 'card' }, h('h2', null, 'Docker'), flash('err', e.message))); }
@@ -377,7 +377,7 @@ async function dockerPage(main) {
     h('div', null, `Docker ${info.version}`, h('span', { class: 'mut' }, ` - ${info.os} - ${info.running} running / ${info.containers} containers - ${info.images} images`)),
     h('div', { class: 'row' }, tabs.map((t) => h('button', { class: state.dockerTab === t ? 'pri' : '', onclick: () => { state.dockerTab = t; render(); } }, t[0].toUpperCase() + t.slice(1)))));
   main.replaceChildren(head, body);
-  await { containers: dockerContainers, images: dockerImages, volumes: dockerVolumes, networks: dockerNetworks }[state.dockerTab](body);
+  await { containers: dockerContainers, images: dockerImages, volumes: dockerVolumes, networks: dockerNetworks, registries: dockerRegistries }[state.dockerTab](body);
 }
 
 const stateBadge = (st) => h('span', { class: `badge ${st === 'running' ? 'ok' : st === 'exited' || st === 'dead' ? 'bad' : 'warn'}` }, st);
@@ -389,23 +389,26 @@ async function dockerContainers(body) {
   const cells = {};
   body.replaceChildren(h('div', { class: 'card' },
     h('div', { class: 'row sp' }, h('h2', null, 'Containers'), h('button', { class: 'pri', onclick: () => runDialog() }, '+ Run container')), msg,
-    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Image', 'State', 'CPU / Mem', 'Ports', '']),
+    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Image', 'State', 'CPU / Mem', 'Ports', 'Networks', '']),
       h('tbody', null, list.map((c) => {
         const live = h('td', { class: 'mut' }, c.state === 'running' ? '...' : '-'); cells[c.id] = live;
         return h('tr', null,
           h('td', null, h('b', null, c.name), c.self && h('span', { class: 'badge' }, 'this panel'), h('div', { class: 'mut' }, c.project ? `stack: ${c.project}` : c.id)),
           h('td', null, c.image), h('td', null, stateBadge(c.state), h('div', { class: 'mut' }, c.status)), live, h('td', null, c.ports || '-'),
-          h('td', { class: 'row' },
+          h('td', null, c.networkInfo?.length ? c.networkInfo.map((n) => h('div', null, h('span', { class: 'badge' }, n.name), n.ip && h('span', { class: 'mut' }, ' ' + n.ip))) : '-'),
+          h('td', { class: 'row wrap' },
             c.state !== 'running' && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/start`)) }, 'Start'),
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/stop`)) }, 'Stop'),
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/restart`)) }, 'Restart'),
             h('button', { onclick: () => logsDialog(c) }, 'Logs'),
             c.state === 'running' && h('button', { onclick: () => terminalDialog(c) }, 'Terminal'),
             c.state === 'running' && h('button', { onclick: () => { state.files = { src: 'container:' + c.id, path: '/', lastContainer: 'container:' + c.id }; state.page = 'files'; render(); } }, 'Files'),
+            h('button', { onclick: () => networksDialog(c) }, 'Networks'),
+            h('button', { onclick: () => updateDialog(c) }, 'Pull / Update'),
             h('button', { onclick: () => detailsDialog(c) }, 'Details'),
             !c.self && h('button', { class: 'bad', onclick: () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => run(() => api('DELETE', `/docker/containers/${c.id}?force=1`))) }, 'Remove')));
       }),
-      list.length === 0 && empty(6, 'No containers.'))))));
+      list.length === 0 && empty(7, 'No containers.'))))));
   // live stats are slow (~1s each, parallel): fill in after the list is on screen
   api('GET', '/docker/containers/stats').then((st) => {
     for (const [id, td] of Object.entries(cells)) {
@@ -582,10 +585,137 @@ async function dockerVolumes(body) {
     list.length === 0 && empty(5, 'No volumes.'))))));
 }
 
+// ---------- networks of one container ----------
+async function networksDialog(c) {
+  const body = h('div', { class: 'mut' }, 'Loading...');
+  const d = dialog(`Networks - ${c.name}`, h('div', null, body, h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
+  d.classList.add('wide');
+  const draw = async () => {
+    try {
+      const [cur, all] = await Promise.all([api('GET', `/docker/containers/${c.id}/networks`), api('GET', '/docker/networks')]);
+      const attached = new Set(cur.networks.map((n) => n.name));
+      const free = all.filter((n) => !attached.has(n.name) && !['host', 'none'].includes(n.name));
+      const msg = h('div');
+      const net = h('select', null, free.map((n) => h('option', { value: n.name }, n.name + (n.subnets[0] ? ` (${n.subnets[0].subnet})` : ''))));
+      const aliases = h('input', { placeholder: 'comma separated, optional' }), ip = h('input', { placeholder: 'optional, e.g. 172.20.0.50' });
+      const detach = (n) => confirmDo(`Disconnect ${c.name} from "${n.name}"? Anything that reaches it through that network (including Caddy) loses access.`,
+        async () => { try { await api('POST', `/docker/containers/${c.id}/networks/disconnect`, { network: n.name }); await draw(); } catch (e) { toast(msg, 'err', e.message); } });
+      body.replaceChildren(
+        cur.mode && h('p', { class: 'mut' }, `Network mode: ${cur.mode}`),
+        h('div', { class: 'tw' }, h('table', null, th(['Network', 'IP', 'Gateway', 'MAC', 'Aliases', '']),
+          h('tbody', null, cur.networks.map((n) => h('tr', null,
+            h('td', null, h('b', null, n.name), n.static && h('span', { class: 'badge' }, 'static ip')), h('td', null, n.ip || '-'), h('td', null, n.gateway || '-'),
+            h('td', { class: 'mut' }, n.mac || '-'), h('td', null, n.aliases.join(', ') || '-'),
+            h('td', null, !c.self && h('button', { class: 'bad', onclick: () => detach(n) }, 'Disconnect')))),
+          cur.networks.length === 0 && empty(6, 'Not connected to any network.')))),
+        msg,
+        h('h2', { style: 'margin-top:1.2rem' }, 'Connect to another network'),
+        free.length
+          ? h('div', null, h('div', { class: 'grid' }, h('div', null, h('label', null, 'Network'), net), h('div', null, h('label', null, 'Aliases'), aliases), h('div', null, h('label', null, 'Static IPv4'), ip)),
+            h('div', { style: 'margin-top:.8rem' }, h('button', { class: 'pri', onclick: async () => {
+              try { await api('POST', `/docker/containers/${c.id}/networks/connect`, { network: net.value, aliases: aliases.value, ipv4: ip.value || undefined }); await draw(); }
+              catch (e) { toast(msg, 'err', e.message); }
+            } }, 'Connect')))
+          : h('p', { class: 'mut' }, 'Already connected to every available network.'));
+    } catch (e) { body.replaceChildren(flash('err', e.message)); }
+  };
+  draw();
+}
+
+// ---------- pull / update ----------
+function updateDialog(c) {
+  const out = h('div');
+  const pull = h('button', null, 'Pull latest image'), upd = h('button', { class: 'pri' }, 'Pull & update container'), rec = h('button', { class: 'bad' }, 'Recreate now (same image)');
+  const all = [pull, upd, rec];
+  const go = (label, fn) => async () => {
+    all.forEach((b) => { b.disabled = true; }); toast(out, 'ok', label);
+    try { await fn(); } catch (e) { toast(out, 'err', e.message); }
+    all.forEach((b) => { b.disabled = false; });
+  };
+  pull.onclick = go('Pulling image...', async () => {
+    const r = await api('POST', `/docker/containers/${c.id}/pull`);
+    toast(out, r.changed ? 'warn' : 'ok', r.changed
+      ? `A newer image of ${r.image} was downloaded (${r.imageId}). The container still runs the old one - press "Pull & update container".`
+      : `${r.image} is already the latest.`);
+  });
+  upd.onclick = go('Pulling and recreating (can take a while)...', async () => {
+    const r = await api('POST', `/docker/containers/${c.id}/update`, { pull: true });
+    toast(out, r.recreated ? 'ok' : 'warn', r.recreated ? `Updated: the new container (${r.id}) is running.` : r.reason);
+  });
+  rec.onclick = go('Recreating...', async () => {
+    const r = await api('POST', `/docker/containers/${c.id}/update`, { pull: false, force: true });
+    toast(out, 'ok', `Recreated: the new container (${r.id}) is running.`);
+  });
+  const d = dialog(`Update - ${c.name}`, h('div', null,
+    h('p', null, 'Image: ', h('b', null, c.image)),
+    h('p', { class: 'mut' }, 'Pull downloads the newest image for this tag (saved registry credentials are used automatically: Docker -> Registries). Update then replaces the container with a new one that keeps its ports, environment, volumes, networks and restart policy. If the new container fails to start, the old one is restored. Data in volumes is kept; changes made inside the container\'s own filesystem are lost.'),
+    c.self && flash('warn', 'This is the panel itself: pull the image here, then run "docker compose up -d" on the server to switch to it.'),
+    out, h('div', { class: 'row', style: 'margin-top:1rem' }, pull, !c.self && upd, !c.self && rec, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
+  d.classList.add('wide');
+}
+
+// ---------- networks tab ----------
 async function dockerNetworks(body) {
-  const list = await api('GET', '/docker/networks');
-  body.replaceChildren(h('div', { class: 'card' }, h('h2', null, 'Networks'), h('div', { class: 'tw' }, h('table', null, th(['Name', 'Driver', 'Scope', 'Subnet', 'Containers', 'Internal']),
-    h('tbody', null, list.map((n) => h('tr', null, h('td', null, n.name), h('td', null, n.driver), h('td', null, n.scope), h('td', null, n.subnet || '-'), h('td', null, n.containers), h('td', null, n.internal ? 'yes' : 'no'))))))));
+  const list = await api('GET', '/docker/networks'), msg = h('div');
+  const act = async (fn) => { try { await fn(); await render(); } catch (e) { toast(msg, 'err', e.message); } };
+  body.replaceChildren(h('div', { class: 'card' },
+    h('div', { class: 'row sp' }, h('h2', null, 'Networks'), h('button', { class: 'pri', onclick: () => createNetDialog() }, '+ Create network')), msg,
+    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Driver / scope', 'Subnet / gateway', 'Containers', 'Flags', '']),
+      h('tbody', null, list.map((n) => h('tr', null,
+        h('td', null, h('b', null, n.name), n.project && h('div', { class: 'mut' }, `stack: ${n.project}`)), h('td', null, `${n.driver} / ${n.scope}`),
+        h('td', null, n.subnets.length ? n.subnets.map((s) => h('div', null, `${s.subnet}${s.gateway ? ` via ${s.gateway}` : ''}`)) : '-'),
+        h('td', null, n.containers.length, n.containers.length > 0 && h('button', { style: 'margin-left:.5rem', onclick: () => membersDialog(n) }, 'Members')),
+        h('td', null, n.internal && h('span', { class: 'badge warn' }, 'internal'), n.builtin && h('span', { class: 'badge' }, 'built-in')),
+        h('td', null, !n.builtin && h('button', { class: 'bad', disabled: n.containers.length > 0, title: n.containers.length ? 'Disconnect its containers first' : '',
+          onclick: () => confirmDo(`Remove network ${n.name}?`, () => act(() => api('DELETE', `/docker/networks/${n.id}`))) }, 'Remove')))),
+      list.length === 0 && empty(6, 'No networks.'))))));
+}
+
+function membersDialog(n) {
+  const msg = h('div');
+  const detach = (m) => confirmDo(`Disconnect ${m.name} from "${n.name}"?`, async () => {
+    try { await api('POST', `/docker/containers/${m.id}/networks/disconnect`, { network: n.name }); d.close(); } catch (e) { toast(msg, 'err', e.message); }
+  });
+  const d = dialog(`Containers on ${n.name}`, h('div', null, msg, h('div', { class: 'tw' }, h('table', null, th(['Container', 'IPv4', 'MAC', '']),
+    h('tbody', null, n.containers.map((m) => h('tr', null, h('td', null, h('b', null, m.name)), h('td', null, m.ipv4 || '-'), h('td', { class: 'mut' }, m.mac || '-'),
+      h('td', null, h('button', { class: 'bad', onclick: () => detach(m) }, 'Disconnect'))))))),
+    h('div', { style: 'margin-top:1rem' }, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
+  d.classList.add('wide');
+}
+
+function createNetDialog() {
+  const err = h('div');
+  const f = { name: h('input', { required: true, placeholder: 'e.g. apps' }), subnet: h('input', { placeholder: 'optional, e.g. 172.31.0.0/24' }), gateway: h('input', { placeholder: 'optional, e.g. 172.31.0.1' }), internal: h('input', { type: 'checkbox' }) };
+  const d = dialog('Create network', h('form', { onsubmit: async (e) => {
+    e.preventDefault();
+    try { await api('POST', '/docker/networks', { name: f.name.value, subnet: f.subnet.value || undefined, gateway: f.gateway.value || undefined, internal: f.internal.checked }); d.close(); render(); }
+    catch (e2) { toast(err, 'err', e2.message); }
+  } }, err, h('label', null, 'Name'), f.name, h('div', { class: 'grid' }, h('div', null, h('label', null, 'Subnet'), f.subnet), h('div', null, h('label', null, 'Gateway'), f.gateway)),
+  h('label', { class: 'ck' }, f.internal, 'Internal (containers on it have no outside access)'),
+  h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { class: 'pri' }, 'Create'), h('button', { type: 'button', onclick: () => d.close() }, 'Cancel'))));
+}
+
+// ---------- registry credentials ----------
+async function dockerRegistries(body) {
+  const list = await api('GET', '/docker/registries'), msg = h('div');
+  const f = {
+    server: h('input', { required: true, placeholder: 'docker.can4net.com or host:port' }), user: h('input', { required: true, autocomplete: 'off' }),
+    pw: h('input', { type: 'password', required: true, autocomplete: 'new-password' }), skip: h('input', { type: 'checkbox' }),
+  };
+  body.replaceChildren(
+    h('div', { class: 'card' }, h('h2', null, 'Registry logins'),
+      h('p', { class: 'mut' }, 'Used automatically whenever an image from that registry is pulled (Images tab, Run container, container Update). Passwords are encrypted in the database; the panel only sends them to the matching registry host.'), msg,
+      h('div', { class: 'tw' }, h('table', null, th(['Registry', 'User', 'Added', '']), h('tbody', null, list.map((r) => h('tr', null, h('td', null, h('b', null, r.server)), h('td', null, r.username), h('td', { class: 'mut' }, r.created_at),
+        h('td', null, h('button', { class: 'bad', onclick: () => confirmDo(`Forget the login for ${r.server}?`, async () => { try { await api('DELETE', `/docker/registries/${r.id}`); render(); } catch (e) { toast(msg, 'err', e.message); } }) }, 'Remove')))),
+      list.length === 0 && empty(4, 'No registry logins yet (public images need none).'))))),
+    h('form', { class: 'card', onsubmit: async (e) => {
+      e.preventDefault();
+      try { await api('POST', '/docker/registries', { server: f.server.value, username: f.user.value, password: f.pw.value, skipVerify: f.skip.checked }); render(); }
+      catch (err) { toast(msg, 'err', err.message); }
+    } }, h('h2', null, 'Add / replace a login'),
+    h('div', { class: 'grid' }, h('div', null, h('label', null, 'Registry'), f.server), h('div', null, h('label', null, 'Username'), f.user), h('div', null, h('label', null, 'Password / token'), f.pw)),
+    h('label', { class: 'ck' }, f.skip, 'Save without testing the login'),
+    h('div', { style: 'margin-top:1rem' }, h('button', { class: 'pri' }, 'Save'))));
 }
 
 // ======================= Files =======================

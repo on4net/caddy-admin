@@ -40,7 +40,7 @@ Settings -> **Panel domain**: give the panel a domain or subdomain (DNS A/AAAA m
 - `panel`: this app, published on `127.0.0.1:8181` only. To reach it remotely add a proxy host (e.g. `panel.example.com` -> `caddy-admin:8181`, Let's Encrypt), then set `SECURE_COOKIE=1`.
 - The Admin API (2019, unauthenticated) is **not published**; it lives on the `admin` network which is `internal: true` and shared only by caddy + panel.
 - To proxy other containers, attach them to the external-facing `proxy` network and use their service/container name as *Forward host*. For services on the Docker host use `host.docker.internal`.
-- Volumes: `panel_data` (SQLite), `caddy_data` (issued certs + ACME account - keep it to avoid Let's Encrypt rate limits), `caddy_config` (autosave used by `--resume`: Caddy comes back with the last pushed config after a restart).
+- Data lives in three **folders next to `docker-compose.yml`** (bind mounts, so you can back them up by copying): `panel_data/` (SQLite: users, hosts, uploaded certificate keys), `caddy_data/` (issued certificates, private keys + ACME account - keep it to avoid Let's Encrypt rate limits), `caddy_config/` (autosave used by `--resume`: Caddy comes back with the last pushed config after a restart). They contain **secrets** (git-ignored, never commit or publish them) and are owned by root; `docker compose down -v` does *not* delete them - remove the folders to reset.
 - The panel only replaces Caddy's `apps` section (`POST /config/apps`), never `admin`, so it cannot lock itself out.
 
 ## CI / scripts: API tokens

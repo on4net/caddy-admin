@@ -3,3 +3,7 @@ data/
 .env
 .remember/
 scripts/
+# runtime data (bind mounts from docker-compose.yml): private keys, ACME account, user DB
+caddy_data/
+caddy_config/
+panel_data/

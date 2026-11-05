@@ -1,6 +1,8 @@
 import http from 'node:http';
 import os from 'node:os';
 import { Transform } from 'node:stream';
+import { db } from './db.js';
+import { decrypt } from './secrets.js';
 
 /** Minimal Docker Engine API client over the unix socket (or Windows named pipe). No dependencies. */
 const socketPath = () => process.env.DOCKER_SOCKET || (process.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock');
@@ -9,12 +11,12 @@ export class DockerError extends Error {
   constructor(message, status = 502) { super(message); this.status = status; }
 }
 
-export function dockerRequest(method, path, { body, timeout = 30_000 } = {}) {
+export function dockerRequest(method, path, { body, timeout = 30_000, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
     const req = http.request({
       socketPath: socketPath(), method, path, timeout,
-      headers: payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {},
+      headers: { ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}), ...headers },
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -23,7 +25,7 @@ export function dockerRequest(method, path, { body, timeout = 30_000 } = {}) {
         if (res.statusCode >= 400) {
           let msg = buf.toString('utf8').trim();
           try { msg = JSON.parse(msg).message || msg; } catch { /* plain text */ }
-          return reject(new DockerError(msg || `Docker error ${res.statusCode}`, [404, 409, 304].includes(res.statusCode) ? res.statusCode : 502));
+          return reject(new DockerError(msg || `Docker error ${res.statusCode}`, res.statusCode === 403 ? 409 : [404, 409, 304].includes(res.statusCode) ? res.statusCode : 502));
         }
         resolve({ status: res.statusCode, buf, headers: res.headers });
       });
@@ -103,7 +105,7 @@ export function dockerStream(method, path, { body, headers = {}, timeout = 0 } =
       res.on('end', () => {
         let msg = Buffer.concat(chunks).toString('utf8').trim();
         try { msg = JSON.parse(msg).message || msg; } catch { /* plain text */ }
-        reject(new DockerError(msg || `Docker error ${res.statusCode}`, [404, 409].includes(res.statusCode) ? res.statusCode : 502));
+        reject(new DockerError(msg || `Docker error ${res.statusCode}`, res.statusCode === 403 ? 409 : [404, 409].includes(res.statusCode) ? res.statusCode : 502));
       });
     });
     req.on('timeout', () => req.destroy(new DockerError('Docker request timed out', 504)));
@@ -168,3 +170,45 @@ export async function execInteractive(containerId, { cmd, user, cols = 80, rows 
 
 export const execResize = (execId, cols, rows) =>
   dockerRequest('POST', `/exec/${execId}/resize?h=${rows}&w=${cols}`).catch(() => {}); // resize is best effort
+
+// ------------------------------------------------------------------ image pull (with private-registry credentials)
+
+/** Registry host of an image reference: first path part if it looks like a host, else Docker Hub. */
+export function registryHost(image) {
+  const first = String(image).split('/')[0];
+  return String(image).includes('/') && (first.includes('.') || first.includes(':') || first === 'localhost') ? first : 'docker.io';
+}
+export const normalizeServer = (s) => String(s).trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase();
+const HUB = ['docker.io', 'index.docker.io', 'registry-1.docker.io'];
+
+/** base64url X-Registry-Auth value for an image if credentials are stored for its registry, else null. */
+export function registryAuthFor(image) {
+  const host = registryHost(image).toLowerCase();
+  const row = db.prepare('SELECT * FROM registries').all().find((r) => {
+    const s = normalizeServer(r.server);
+    return s === host || (HUB.includes(host) && HUB.includes(s));
+  });
+  if (!row) return null;
+  const cfg = { username: row.username, password: decrypt(row.password_enc), serveraddress: HUB.includes(host) ? 'https://index.docker.io/v1/' : host };
+  return Buffer.from(JSON.stringify(cfg)).toString('base64url');
+}
+
+/** Split "repo/name:tag" / "name@digest" for the pull API. */
+export function splitImage(image) {
+  if (image.includes('@')) return [image, null];
+  const i = image.lastIndexOf(':');
+  return i > image.lastIndexOf('/') ? [image.slice(0, i), image.slice(i + 1)] : [image, 'latest'];
+}
+
+/** Pull an image and wait for it to finish; errors that arrive in the progress stream are thrown. */
+export async function pullImage(image) {
+  const [name, tag] = splitImage(image);
+  const auth = registryAuthFor(image);
+  const { buf } = await dockerRequest('POST', `/images/create?${new URLSearchParams({ fromImage: name, ...(tag && { tag }) })}`, {
+    timeout: 15 * 60_000, ...(auth && { headers: { 'X-Registry-Auth': auth } }),
+  });
+  for (const line of buf.toString('utf8').split(String.fromCharCode(10)).filter(Boolean)) { // NDJSON progress
+    let j; try { j = JSON.parse(line); } catch { continue; }
+    if (j.error) throw new DockerError(j.error, 502);
+  }
+}

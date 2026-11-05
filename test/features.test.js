@@ -32,7 +32,8 @@ function rawZip(files) {
   return Buffer.concat([...locals, cd, eocd]);
 }
 
-const dk = { calls: [], createAttempts: 0, execN: 0, execs: {}, resizes: [] };
+const dk = { calls: [], createAttempts: 0, execN: 0, execs: {}, resizes: [], imageId: 'sha256:oldimg' };
+const NET_PROXY = 'p'.repeat(64), NET_OTHER = 'o'.repeat(64);
 const { fileHeader } = await import('../src/tar.js');
 const tarOf = (name, text) => Buffer.concat([fileHeader(name, text.length), Buffer.from(text), Buffer.alloc(512 - text.length), Buffer.alloc(1024)]);
 const DIR_TAR = Buffer.from('FAKE-DIRECTORY-TAR');
@@ -93,13 +94,45 @@ const fakeDocker = http.createServer((req, res) => {
       res.writeHead(200);
       return res.end(p === '/etc' ? DIR_TAR : p === '/etc/hello.zip' ? tarOfBuf('hello.zip', ZIP_BYTES) : tarOf('hello.txt', 'hello world'));
     }
+    // ---- networks / container update / registry (fake) ----
+    const NEWC = 'c'.repeat(64);
+    if (u === '/networks') return json([{ Id: NET_PROXY, Name: 'proxy' }, { Id: NET_OTHER, Name: 'other' }, { Id: 'b'.repeat(64), Name: 'bridge' }]);
+    if (req.method === 'GET' && /^\/networks\/[0-9a-z]+$/.test(u)) {
+      const id = u.split('/')[2];
+      if (NET_PROXY.startsWith(id)) return json({ Id: NET_PROXY, Name: 'proxy', Driver: 'bridge', Scope: 'local', Internal: false, Labels: { 'com.docker.compose.project': 'stack' }, IPAM: { Config: [{ Subnet: '172.20.0.0/16', Gateway: '172.20.0.1' }] }, Containers: { [OTHER]: { Name: 'web', IPv4Address: '172.20.0.2/16', MacAddress: '02:42:ac:14:00:02' } } });
+      if (NET_OTHER.startsWith(id)) return json({ Id: NET_OTHER, Name: 'other', Driver: 'bridge', Scope: 'local', IPAM: { Config: [] }, Containers: {} });
+      return json({ Id: id, Name: 'bridge', Driver: 'bridge', Scope: 'local', IPAM: { Config: [] }, Containers: {} });
+    }
+    if (req.method === 'POST' && u === '/networks/create') { dk.netCreate = JSON.parse(body); return json({ Id: 'n'.repeat(64) }, 201); }
+    if (req.method === 'DELETE' && u.startsWith('/networks/')) { res.writeHead(204); return res.end(); }
+    if (req.method === 'POST' && /^\/networks\/[^/]+\/(connect|disconnect)$/.test(u)) { dk.netOp = { url: u, body: JSON.parse(body) }; res.writeHead(200); return res.end(); }
+    if (req.method === 'POST' && u === '/auth') { const b = JSON.parse(body); if (b.password === 'bad') return json({ message: 'unauthorized: incorrect username or password' }, 401); return json({ Status: 'Login Succeeded' }); }
+    if (req.method === 'GET' && u.startsWith('/images/sha256%3Aoldimg/json')) return json({ Config: { Env: ['PATH=/usr/bin', 'NGINX_VERSION=1.25'], Cmd: ['nginx', '-g', 'daemon off;'], Entrypoint: ['/docker-entrypoint.sh'], Labels: { maintainer: 'img' }, ExposedPorts: { '80/tcp': {} } } });
+    if (req.method === 'GET' && u.startsWith('/images/') && u.endsWith('/json')) return json({ Id: dk.imageId });
+    if (req.method === 'POST' && u.includes('/rename')) { res.writeHead(204); return res.end(); }
+    if (req.method === 'DELETE' && u.startsWith('/containers/')) { res.writeHead(204); return res.end(); }
+    if (req.method === 'POST' && dk.failStart && u.startsWith(`/containers/${NEWC}/start`)) return json({ message: 'driver failed programming external connectivity' }, 500);
+    if (req.method === 'GET' && /^\/containers\/[0-9a-zA-Z]+\/json$/.test(u)) {
+      const self = u.includes(SELF.slice(0, 12));
+      const id = self ? SELF : OTHER, short = id.slice(0, 12);
+      return json({
+        Id: id, Name: self ? '/panel' : '/web', Image: 'sha256:oldimg', State: { Running: true },
+        Config: { Image: 'nginx:1.25', Hostname: short, Tty: false, Env: ['PATH=/usr/bin', 'NGINX_VERSION=1.25', 'MY_SETTING=on'], Cmd: ['nginx', '-g', 'daemon off;'], Entrypoint: ['/docker-entrypoint.sh'], Labels: { 'com.docker.compose.project': 'stack', maintainer: 'img' }, ExposedPorts: { '80/tcp': {} } },
+        HostConfig: { Binds: ['/srv/site:/usr/share/nginx/html:ro'], PortBindings: { '80/tcp': [{ HostPort: '8080' }] }, RestartPolicy: { Name: 'unless-stopped' }, NetworkMode: 'proxy' },
+        Mounts: [{ Type: 'bind', Source: '/srv/site', Destination: '/usr/share/nginx/html', RW: false }, { Type: 'volume', Name: 'a'.repeat(64), Destination: '/data', RW: true }],
+        NetworkSettings: { Networks: {
+          proxy: { NetworkID: NET_PROXY, IPAddress: '172.20.0.2', Gateway: '172.20.0.1', MacAddress: '02:42:ac:14:00:02', Aliases: [short, 'web', 'site'], IPAMConfig: null },
+          other: { NetworkID: NET_OTHER, IPAddress: '10.9.0.5', Gateway: '10.9.0.1', MacAddress: '02:42:0a:09:00:05', Aliases: [short, 'web2'], IPAMConfig: { IPv4Address: '10.9.0.5' } },
+        } },
+      });
+    }
     if (u.endsWith('/json') && u.startsWith('/containers/')) return json({ Config: { Tty: false }, Name: '/web' });
     if (u.startsWith('/containers/') && u.includes('/logs')) { res.writeHead(200); return res.end(Buffer.concat([frame(1, 'hello\n'), frame(2, 'oops\n')])); }
     if (u.startsWith('/containers/create')) {
       if (++dk.createAttempts === 1) return json({ message: 'No such image: redis:7' }, 404);
       dk.createBody = JSON.parse(body); return json({ Id: 'c'.repeat(64) }, 201);
     }
-    if (u.startsWith('/images/create')) { res.writeHead(200); return res.end('{"status":"Pulling"}\n{"status":"Done"}\n'); }
+    if (u.startsWith('/images/create')) { dk.lastPullAuth = req.headers['x-registry-auth']; res.writeHead(200); return res.end('{"status":"Pulling"}\n{"status":"Done"}\n'); }
     if (/^\/containers\/[^/]+\/(start|stop|restart)/.test(u)) { res.writeHead(204); return res.end(); }
     if (u === '/info') return json({ Containers: 2, ContainersRunning: 2, ContainersPaused: 0, ContainersStopped: 0, Images: 3, OperatingSystem: 'Test', KernelVersion: '1' });
     if (u === '/version') return json({ Version: '29.0', ApiVersion: '1.50' });
@@ -516,4 +549,137 @@ test('fm container: zip a file into the container and unzip an archive inside it
   assert.ok(dk.putTar.includes('zipped hello') && dk.putTar.includes('dir/deep.txt'));
   const uf = await call('POST', '/fm/unzip', { src: CT, path: '/etc/hello.zip', dest: '/etc', folder: true });
   assert.equal(uf.status, 200); assert.ok(dk.putTar.includes('hello/inner.txt'));
+});
+
+// ================= networks, per-container networking, pull / update, registries =================
+const D = (url, ck = cookie) => call('GET', url, null, ck);
+const W12 = OTHER.slice(0, 12);
+
+test('networks: list with members, subnet, built-in flag; details; non-admin refused', async () => {
+  const r = (await D('/docker/networks')).body;
+  const proxy = r.find((n) => n.name === 'proxy');
+  assert.deepEqual(proxy.subnets, [{ subnet: '172.20.0.0/16', gateway: '172.20.0.1' }]);
+  assert.deepEqual(proxy.containers.map((c) => [c.name, c.ipv4, c.mac]), [['web', '172.20.0.2', '02:42:ac:14:00:02']]); // mask stripped
+  assert.equal(proxy.project, 'stack'); assert.equal(proxy.builtin, false);
+  assert.equal(r.find((n) => n.name === 'bridge').builtin, true);
+  assert.equal((await D(`/docker/networks/${NET_PROXY.slice(0, 12)}`)).body.containers.length, 1);
+  assert.equal((await D('/docker/networks', userCookie)).status, 403);
+});
+
+test('networks: create (validated) and delete (built-ins protected)', async () => {
+  assert.equal((await call('POST', '/docker/networks', { name: 'apps', subnet: '172.31.0.0/24', gateway: '172.31.0.1', internal: true })).status, 201);
+  assert.deepEqual(dk.netCreate.IPAM.Config, [{ Subnet: '172.31.0.0/24', Gateway: '172.31.0.1' }]);
+  assert.equal(dk.netCreate.Internal, true); assert.equal(dk.netCreate.Driver, 'bridge');
+  for (const bad of [{ name: 'bad name!' }, { name: 'host' }, { name: 'x', subnet: 'nonsense' }, { name: 'x', subnet: '10.0.0.0/8', gateway: 'gw' }]) {
+    assert.equal((await call('POST', '/docker/networks', bad)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal((await call('DELETE', `/docker/networks/${'b'.repeat(12)}`)).status, 400); // bridge
+  assert.equal((await call('DELETE', `/docker/networks/${NET_OTHER.slice(0, 12)}`)).status, 200);
+});
+
+test('container networks: detail, connect (aliases/static ip), disconnect, panel protected', async () => {
+  const r = (await D(`/docker/containers/${W12}/networks`)).body;
+  assert.equal(r.mode, 'proxy');
+  const proxy = r.networks.find((n) => n.name === 'proxy'), other = r.networks.find((n) => n.name === 'other');
+  assert.deepEqual(proxy.aliases, ['web', 'site']); // the container-id alias is hidden
+  assert.equal(proxy.ip, '172.20.0.2'); assert.equal(proxy.mac, '02:42:ac:14:00:02'); assert.equal(proxy.static, false);
+  assert.equal(other.static, true);
+  // list endpoint carries the same info for the table
+  const row = (await D('/docker/containers')).body.find((c) => c.name === 'web');
+  assert.ok(row.networkInfo !== undefined);
+
+  assert.equal((await call('POST', `/docker/containers/${W12}/networks/connect`, { network: 'apps', aliases: 'api, backend', ipv4: '172.31.0.10' })).status, 200);
+  assert.equal(dk.netOp.url, '/networks/apps/connect');
+  assert.deepEqual(dk.netOp.body, { Container: W12, EndpointConfig: { Aliases: ['api', 'backend'], IPAMConfig: { IPv4Address: '172.31.0.10' } } });
+  for (const bad of [{ network: '' }, { network: 'host' }, { network: 'apps', aliases: 'bad alias!' }, { network: 'apps', ipv4: '999' }, { network: '../x' }]) {
+    assert.equal((await call('POST', `/docker/containers/${W12}/networks/connect`, bad)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal((await call('POST', `/docker/containers/${W12}/networks/disconnect`, { network: 'other', force: true })).status, 200);
+  assert.equal(dk.netOp.url, '/networks/other/disconnect');
+  assert.deepEqual(dk.netOp.body, { Container: OTHER, Force: true });
+  assert.equal((await call('POST', `/docker/containers/${SELF.slice(0, 12)}/networks/disconnect`, { network: 'proxy' })).status, 400); // would cut the panel off
+  assert.equal((await call('POST', `/docker/containers/${W12}/networks/disconnect`, null, userCookie)).status, 403);
+});
+
+test('registries: credentials are verified, stored encrypted, never returned, used for pulls of matching hosts only', async () => {
+  assert.equal((await call('POST', '/docker/registries', { server: 'reg.example.com', username: 'ci', password: 'bad' })).status, 400); // docker login refused
+  assert.equal((await call('POST', '/docker/registries', { server: 'not a host', username: 'ci', password: 'x' })).status, 400);
+  const ok = await call('POST', '/docker/registries', { server: 'https://Reg.Example.com/', username: 'ci', password: 'pw-secret-1' });
+  assert.equal(ok.status, 201); assert.equal(ok.body.server, 'reg.example.com');
+  const listed = (await D('/docker/registries')).body;
+  assert.deepEqual(listed.map((r) => [r.server, r.username]), [['reg.example.com', 'ci']]);
+  assert.ok(!JSON.stringify(listed).includes('pw-secret'));
+  const stored = db.prepare('SELECT password_enc FROM registries').get().password_enc;
+  assert.ok(stored.startsWith('v1:') && !stored.includes('pw-secret')); // encrypted at rest
+
+  const auth = () => dk.lastPullAuth && JSON.parse(Buffer.from(dk.lastPullAuth, 'base64url').toString());
+  assert.equal((await call('POST', '/docker/images/pull', { image: 'reg.example.com/team/app:2' })).status, 200);
+  assert.deepEqual(auth(), { username: 'ci', password: 'pw-secret-1', serveraddress: 'reg.example.com' });
+  assert.equal((await call('POST', '/docker/images/pull', { image: 'nginx:1.25' })).status, 200);
+  assert.equal(dk.lastPullAuth, undefined); // Docker Hub image: no credentials sent to the wrong registry
+  assert.equal((await call('POST', '/docker/images/pull', { image: 'reg.example.com.evil.io/app' })).status, 200);
+  assert.equal(dk.lastPullAuth, undefined); // look-alike host must not receive them either
+
+  const id = listed[0].id;
+  assert.equal((await call('DELETE', `/docker/registries/${id}`)).status, 200);
+  await call('POST', '/docker/images/pull', { image: 'reg.example.com/team/app:2' });
+  assert.equal(dk.lastPullAuth, undefined);
+});
+
+test('container pull: pulls its image tag and reports whether it is newer', async () => {
+  dk.imageId = 'sha256:newimg';
+  const r = await call('POST', `/docker/containers/${W12}/pull`);
+  assert.equal(r.status, 200); assert.equal(r.body.image, 'nginx:1.25'); assert.equal(r.body.changed, true);
+  assert.ok(dk.calls.some((c) => c.startsWith('POST /images/create?fromImage=nginx&tag=1.25')));
+  dk.imageId = 'sha256:oldimg';
+  assert.equal((await call('POST', `/docker/containers/${W12}/pull`)).body.changed, false);
+});
+
+test('container update: nothing to do when already on the latest image', async () => {
+  dk.imageId = 'sha256:oldimg';
+  const mark = dk.calls.length;
+  const r = await call('POST', `/docker/containers/${W12}/update`, {});
+  assert.equal(r.body.recreated, false);
+  assert.ok(!dk.calls.slice(mark).some((c) => c.startsWith('POST /containers/create')));
+});
+
+test('container update: recreates with the same settings, keeps volumes + networks, removes the old one', async () => {
+  dk.imageId = 'sha256:newimg';
+  const mark = dk.calls.length;
+  const r = await call('POST', `/docker/containers/${W12}/update`, {});
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.recreated, true);
+  const steps = dk.calls.slice(mark);
+  const at = (re) => steps.findIndex((c) => re.test(c));
+  const [iStop, iRename, iCreate, iStart, iRm] = [at(/containers\/\w+\/stop/), at(/\/rename\?name=web_old_/), at(/containers\/create\?name=web$/), at(new RegExp(`containers/${'c'.repeat(64)}/start`)), at(/^DELETE \/containers\/\w+\?v=0$/)];
+  assert.ok(iStop < iRename && iRename < iCreate && iCreate < iStart && iStart < iRm, JSON.stringify(steps)); // old is parked, new created+started, old removed WITHOUT its volumes
+  const b = dk.createBody;
+  assert.equal(b.Image, 'nginx:1.25');
+  assert.deepEqual(b.Env, ['MY_SETTING=on']);                       // image defaults are not pinned
+  assert.equal(b.Cmd, undefined); assert.equal(b.Entrypoint, undefined); assert.equal(b.Hostname, undefined);
+  assert.deepEqual(b.Labels, { 'com.docker.compose.project': 'stack' });
+  assert.deepEqual(b.HostConfig.PortBindings, { '80/tcp': [{ HostPort: '8080' }] });
+  assert.equal(b.HostConfig.RestartPolicy.Name, 'unless-stopped');
+  assert.ok(b.HostConfig.Binds.includes('/srv/site:/usr/share/nginx/html:ro'));
+  assert.ok(b.HostConfig.Binds.includes(`${'a'.repeat(64)}:/data`)); // anonymous volume re-attached by name: data survives
+  assert.deepEqual(b.NetworkingConfig.EndpointsConfig.proxy.Aliases, ['web', 'site']);
+  assert.deepEqual(b.NetworkingConfig.EndpointsConfig.other.IPAMConfig, { IPv4Address: '10.9.0.5' });
+});
+
+test('container update: a replacement that fails to start is rolled back to the original', async () => {
+  dk.imageId = 'sha256:newimg'; dk.failStart = true;
+  const mark = dk.calls.length;
+  const r = await call('POST', `/docker/containers/${W12}/update`, { force: true });
+  dk.failStart = false;
+  assert.ok(r.status >= 400); assert.match(r.body.error, /driver failed/);
+  const steps = dk.calls.slice(mark);
+  assert.ok(steps.some((c) => c === `DELETE /containers/${'c'.repeat(64)}?force=1`), 'broken new container removed');
+  const back = steps.findIndex((c) => c.includes(`/containers/${OTHER}/rename?name=web`) && !c.includes('_old_'));
+  assert.ok(back >= 0, 'original renamed back');
+  assert.ok(steps.slice(back).some((c) => c.startsWith(`POST /containers/${OTHER}/start`)), 'original started again');
+  assert.ok(!steps.some((c) => c === `DELETE /containers/${OTHER}?v=0`), 'original is NOT deleted');
+});
+
+test('container update: the panel cannot replace itself; non-admin refused', async () => {
+  assert.equal((await call('POST', `/docker/containers/${SELF.slice(0, 12)}/update`, { force: true })).status, 400);
+  assert.equal((await call('POST', `/docker/containers/${W12}/update`, {}, userCookie)).status, 403);
 });

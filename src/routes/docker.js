@@ -3,7 +3,9 @@ import { audit } from '../db.js';
 import { requireAdmin } from '../auth.js';
 import { ValidationError } from '../validate.js';
 import { StringDecoder } from 'node:string_decoder';
-import { dockerRequest, dockerJson, dockerStream, createDemuxer, demuxLogs, summarizeStats, selfId, DockerError } from '../docker.js';
+import { dockerRequest, dockerJson, dockerStream, createDemuxer, demuxLogs, summarizeStats, pullImage, DockerError } from '../docker.js';
+import { NAME_RE, IMAGE_RE, idParam, isSelf, q } from './dockerutil.js';
+import { dockerops } from './dockerops.js';
 
 /**
  * Docker management (admin only). WARNING: access to docker.sock is root-equivalent on the host,
@@ -12,12 +14,7 @@ import { dockerRequest, dockerJson, dockerStream, createDemuxer, demuxLogs, summ
 export const docker = Router();
 docker.use(requireAdmin);
 
-const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
-const ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
-const IMAGE_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.:/@-]{0,255}$/;
-const idParam = (v) => { if (!ID_RE.test(v)) throw new ValidationError('Invalid id'); return v; };
-const isSelf = (id) => { const me = selfId(); return id.length >= 4 && (me.startsWith(id) || id.startsWith(me)); };
-const q = (o) => new URLSearchParams(o).toString();
+
 
 const portsText = (ports) => [...new Set((ports || []).map((p) =>
   p.PublicPort ? `${p.IP && p.IP !== '0.0.0.0' && p.IP !== '::' ? p.IP + ':' : ''}${p.PublicPort}->${p.PrivatePort}/${p.Type}` : `${p.PrivatePort}/${p.Type}`))].join(', ');
@@ -37,6 +34,7 @@ docker.get('/containers', async (req, res) => {
     id: c.Id.slice(0, 12), name: (c.Names[0] || '').replace(/^\//, ''), image: c.Image, state: c.State, status: c.Status,
     ports: portsText(c.Ports), created: c.Created, project: c.Labels?.['com.docker.compose.project'] || '',
     networks: Object.keys(c.NetworkSettings?.Networks || {}), self: isSelf(c.Id),
+    networkInfo: Object.entries(c.NetworkSettings?.Networks || {}).map(([name, n]) => ({ name, ip: n.IPAddress || '', gateway: n.Gateway || '', mac: n.MacAddress || '' })),
   })).sort((a, b) => a.name.localeCompare(b.name)));
 });
 
@@ -58,6 +56,7 @@ docker.get('/containers/:id', async (req, res) => {
     cmd: c.Config.Cmd, env: c.Config.Env, restartPolicy: c.HostConfig.RestartPolicy?.Name,
     mounts: (c.Mounts || []).map((m) => ({ type: m.Type, source: m.Source || m.Name, destination: m.Destination, rw: m.RW })),
     networks: Object.fromEntries(Object.entries(c.NetworkSettings?.Networks || {}).map(([k, n]) => [k, n.IPAddress])),
+    networkInfo: Object.entries(c.NetworkSettings?.Networks || {}).map(([name, n]) => ({ name, ip: n.IPAddress || '', gateway: n.Gateway || '', mac: n.MacAddress || '' })),
     ports: c.NetworkSettings?.Ports,
   });
 });
@@ -105,6 +104,9 @@ docker.get('/containers/:id/logs/download', async (req, res) => {
   req.on('close', () => src.destroy());
   src.pipe(createDemuxer(!!info.Config?.Tty)).pipe(res);
 });
+
+// networks of a container, pull/update, registries, network management (must come before the generic :action route)
+docker.use(dockerops);
 
 const ACTIONS = { start: 'start', stop: 'stop', restart: 'restart', pause: 'pause', unpause: 'unpause', kill: 'kill' };
 docker.post('/containers/:id/:action', async (req, res) => {
@@ -169,14 +171,6 @@ docker.post('/containers', async (req, res) => {
 });
 
 // ---------- images ----------
-async function pullImage(image) {
-  const [name, tag] = image.includes('@') ? [image, null] : (() => { const i = image.lastIndexOf(':'); return i > image.lastIndexOf('/') ? [image.slice(0, i), image.slice(i + 1)] : [image, 'latest']; })();
-  const { buf } = await dockerRequest('POST', `/images/create?${q({ fromImage: name, ...(tag && { tag }) })}`, { timeout: 15 * 60_000 });
-  for (const line of buf.toString('utf8').split('\n').filter(Boolean)) { // NDJSON progress; errors arrive in-band
-    try { const j = JSON.parse(line); if (j.error) throw new DockerError(j.error, 502); } catch (e) { if (e instanceof DockerError) throw e; }
-  }
-}
-
 docker.get('/images', async (req, res) => {
   const [imgs, ctrs] = await Promise.all([dockerJson('GET', '/images/json'), dockerJson('GET', '/containers/json?all=1')]);
   const used = new Set(ctrs.map((c) => c.ImageID));
@@ -216,11 +210,4 @@ docker.delete('/volumes/:name', async (req, res) => {
   await dockerRequest('DELETE', `/volumes/${idParam(req.params.name)}`);
   audit(req.user.id, 'docker_volume_rm', req.params.name);
   res.json({ ok: true });
-});
-docker.get('/networks', async (req, res) => {
-  const n = await dockerJson('GET', '/networks');
-  res.json(n.map((x) => ({
-    id: x.Id.slice(0, 12), name: x.Name, driver: x.Driver, scope: x.Scope, internal: x.Internal,
-    subnet: x.IPAM?.Config?.[0]?.Subnet || '', containers: Object.keys(x.Containers || {}).length,
-  })));
 });
