@@ -1,0 +1,102 @@
+# Settings (bind IP, ports, first admin) come from .env - see .env.example
+services:
+  # The reverse proxy itself: official Caddy image, configured only through its Admin API by the panel.
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    # --resume: after a restart Caddy reloads the last config the panel pushed
+    command: caddy run --config /etc/caddy/bootstrap.json --resume
+    ports:
+      - "${CADDY_BIND_IP:-0.0.0.0}:${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_BIND_IP:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443"
+      - "${CADDY_BIND_IP:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/udp"   # HTTP/3
+      # The Admin API (2019, unauthenticated) is always enabled for the panel but deliberately NOT published.
+    volumes:
+      - ./docker/caddy-bootstrap.json:/etc/caddy/bootstrap.json:ro
+      - caddy_data:/data       # issued certificates + ACME account: keep it, or you hit Let's Encrypt rate limits
+      - caddy_config:/config   # autosaved config used by --resume
+    networks: [admin, proxy]
+    # healthy only while the Admin API answers; the panel waits for this
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # forward to services running on the Docker host
+
+  # The management panel
+  panel:
+    build: .
+    image: caddy-admin:latest
+    container_name: caddy-admin
+    restart: unless-stopped
+    depends_on:
+      caddy:
+        condition: service_healthy
+    environment:
+      CADDY_ADMIN_URL: http://caddy:2019
+      CADDY_HOST: caddy          # for the live SSL status probe (TLS handshake to caddy:443)
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SECURE_COOKIE: ${SECURE_COOKIE:-0}
+      CERT_ASK_TOKEN: ${CERT_ASK_TOKEN:-}
+      DOCKER_SOCKET: /var/run/docker.sock
+      MONITOR_DISKS: ${MONITOR_DISKS:-/|System}
+      MOUNT_1_PATH: ${MOUNT_1_PATH:-}
+      MOUNT_1_NAME: ${MOUNT_1_NAME:-}
+      MOUNT_1_MODE: ${MOUNT_1_MODE:-ro}
+      MOUNT_2_PATH: ${MOUNT_2_PATH:-}
+      MOUNT_2_NAME: ${MOUNT_2_NAME:-}
+      MOUNT_2_MODE: ${MOUNT_2_MODE:-ro}
+      MOUNT_3_PATH: ${MOUNT_3_PATH:-}
+      MOUNT_3_NAME: ${MOUNT_3_NAME:-}
+      MOUNT_3_MODE: ${MOUNT_3_MODE:-ro}
+      MOUNT_4_PATH: ${MOUNT_4_PATH:-}
+      MOUNT_4_NAME: ${MOUNT_4_NAME:-}
+      MOUNT_4_MODE: ${MOUNT_4_MODE:-ro}
+      MOUNT_5_PATH: ${MOUNT_5_PATH:-}
+      MOUNT_5_NAME: ${MOUNT_5_NAME:-}
+      MOUNT_5_MODE: ${MOUNT_5_MODE:-ro}
+      MOUNT_6_PATH: ${MOUNT_6_PATH:-}
+      MOUNT_6_NAME: ${MOUNT_6_NAME:-}
+      MOUNT_6_MODE: ${MOUNT_6_MODE:-ro}
+      MOUNT_7_PATH: ${MOUNT_7_PATH:-}
+      MOUNT_7_NAME: ${MOUNT_7_NAME:-}
+      MOUNT_7_MODE: ${MOUNT_7_MODE:-ro}
+      MOUNT_8_PATH: ${MOUNT_8_PATH:-}
+      MOUNT_8_NAME: ${MOUNT_8_NAME:-}
+      MOUNT_8_MODE: ${MOUNT_8_MODE:-ro}
+    # The panel manages the server, so it needs root + host visibility. All of this is admin-only in the UI.
+    user: "0:0"
+    pid: host                  # lets the monitor read the HOST's network counters (/proc/1/net/dev)
+    ports:
+      - "${PANEL_BIND_IP:-127.0.0.1}:${PANEL_PORT:-8181}:8181"
+    volumes:
+      - panel_data:/app/data   # SQLite DB (users, hosts, uploaded cert keys)
+      # Docker management. NOTE: access to this socket is root-equivalent on the host.
+      - ${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      # File manager folders: MOUNT_n_PATH in .env (unused slots mount an empty read-only dir)
+      - "${MOUNT_1_PATH:-./docker/empty}:/mnt/files/1:${MOUNT_1_MODE:-ro}"
+      - "${MOUNT_2_PATH:-./docker/empty}:/mnt/files/2:${MOUNT_2_MODE:-ro}"
+      - "${MOUNT_3_PATH:-./docker/empty}:/mnt/files/3:${MOUNT_3_MODE:-ro}"
+      - "${MOUNT_4_PATH:-./docker/empty}:/mnt/files/4:${MOUNT_4_MODE:-ro}"
+      - "${MOUNT_5_PATH:-./docker/empty}:/mnt/files/5:${MOUNT_5_MODE:-ro}"
+      - "${MOUNT_6_PATH:-./docker/empty}:/mnt/files/6:${MOUNT_6_MODE:-ro}"
+      - "${MOUNT_7_PATH:-./docker/empty}:/mnt/files/7:${MOUNT_7_MODE:-ro}"
+      - "${MOUNT_8_PATH:-./docker/empty}:/mnt/files/8:${MOUNT_8_MODE:-ro}"
+    networks: [admin, proxy]
+
+networks:
+  # Only caddy + panel can reach the admin API (2019). `internal` = no outside access.
+  admin:
+    internal: true
+  # Put the containers you want to proxy on this network (use their service name as Forward host).
+  proxy:
+    name: proxy
+
+volumes:
+  panel_data:
+  caddy_data:
+  caddy_config:
