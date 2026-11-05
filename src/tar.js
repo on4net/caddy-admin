@@ -182,7 +182,8 @@ export async function extractTar(readable, destAbs, { overwrite = false, maxByte
       const closed = once(ws, 'close'); const failed = new Promise((_, rej) => ws.once('error', rej));
       await Promise.race([(async () => { await r.pipeTo(ws, size); ws.end(); await closed; })(), failed]);
       await r.skip(pad(size));
-      await fsp.chmod(abs, (h.mode & 0o7777) || 0o644).catch(() => {});
+      // only rwx bits: never restore setuid/setgid/sticky from an untrusted archive (the panel runs as root)
+      await fsp.chmod(abs, (h.mode & 0o777) || 0o644).catch(() => {});
       await fsp.utimes(abs, h.mtime, h.mtime).catch(() => {});
       summary.files++;
     } else if (h.type === '2') {
@@ -193,7 +194,7 @@ export async function extractTar(readable, destAbs, { overwrite = false, maxByte
   }
   for (const [abs, mtime, mode] of dirTimes.reverse()) { // after contents are written
     await fsp.utimes(abs, mtime, mtime).catch(() => {});
-    await fsp.chmod(abs, ((mode & 0o7777) || 0o755) | 0o700).catch(() => {});
+    await fsp.chmod(abs, ((mode & 0o777) || 0o755) | 0o700).catch(() => {});
   }
   return summary;
 }

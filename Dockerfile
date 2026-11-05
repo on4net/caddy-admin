@@ -1,8 +1,13 @@
-FROM node:24-alpine
+# NODE_IMAGE / NPM_REGISTRY let a network that cannot reach Docker Hub / registry.npmjs.org build through a
+# mirror or a Nexus proxy (scripts/publish-images.sh passes them from scripts/.env). Defaults are the public ones.
+ARG NODE_IMAGE=node:24-alpine
+FROM ${NODE_IMAGE}
+ARG NPM_REGISTRY=
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi \
+ && npm ci --omit=dev
 COPY src ./src
 COPY public ./public
 

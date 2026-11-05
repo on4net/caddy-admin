@@ -17,6 +17,19 @@ docker compose logs panel | grep -A3 "First-time"   # setup token
 
 Then open `http://127.0.0.1:8181`: the **setup page** asks for the setup token (from the log) and lets you choose the admin email/password and, optionally, the panel's domain. The token exists because whoever reaches an unconfigured panel first would otherwise own it. For unattended installs set `ADMIN_EMAIL` + `ADMIN_PASSWORD` in `.env` instead (and optionally `SETUP_TOKEN` to fix the token).
 
+### Publishing the image (Nexus / any Docker registry)
+
+`scripts/publish-images.sh` builds the panel image and pushes it (version + `latest`) so servers can pull it instead of building:
+
+```bash
+cp scripts/.env.example scripts/.env     # NEXUS_USERNAME, NEXUS_PASSWORD, REGISTRY (the Docker *connector* host:port), ...
+./scripts/publish-images.sh              # build + push package.json's version and latest
+./scripts/publish-images.sh --bump patch # as a new version (remembered in scripts/.env)
+./scripts/publish-images.sh build        # build only      |  push  # push what was built   |  --no-latest, --version X.Y.Z
+```
+
+On the server set `PANEL_IMAGE=<registry>/caddy-admin:<version>` in `.env`, then `docker login <registry> && docker compose pull panel && docker compose up -d --no-build`. `CADDY_IMAGE` does the same for Caddy. Networks that cannot reach Docker Hub / npmjs can build through mirrors with `NODE_IMAGE` and `NPM_REGISTRY` in `scripts/.env`. Never commit `scripts/.env` (it holds the registry password).
+
 ### Panel on its own domain
 
 Settings -> **Panel domain**: give the panel a domain or subdomain (DNS A/AAAA must point at the server, ports 80/443 open) with Let's Encrypt, internal CA, a custom certificate or plain HTTP, plus Force SSL / HSTS. Caddy then proxies that domain to the panel (`PANEL_UPSTREAM`, `panel:8181` in compose); "Check SSL" / "Wait for certificate" show issuance status. The local address `http://127.0.0.1:8181` keeps working regardless, so a wrong domain or failed issuance cannot lock you out. A proxy host cannot use the panel's domain and vice versa. The session cookie becomes `Secure` automatically over HTTPS, and login throttling sees the real client IP (X-Forwarded-For from Caddy).

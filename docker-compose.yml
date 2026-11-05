@@ -2,7 +2,7 @@
 services:
   # The reverse proxy itself: official Caddy image, configured only through its Admin API by the panel.
   caddy:
-    image: caddy:2-alpine
+    image: ${CADDY_IMAGE:-caddy:2-alpine}   # override to pull Caddy from your own registry/mirror
     container_name: caddy
     restart: unless-stopped
     # --resume: after a restart Caddy reloads the last config the panel pushed
@@ -14,8 +14,8 @@ services:
       # The Admin API (2019, unauthenticated) is always enabled for the panel but deliberately NOT published.
     volumes:
       - ./docker/caddy-bootstrap.json:/etc/caddy/bootstrap.json:ro
-      - caddy_data:/data       # issued certificates + ACME account: keep it, or you hit Let's Encrypt rate limits
-      - caddy_config:/config   # autosaved config used by --resume
+      - ./caddy_data:/data       # issued certificates + ACME account: keep it, or you hit Let's Encrypt rate limits
+      - ./caddy_config:/config   # autosaved config used by --resume
     networks: [admin, proxy]
     # healthy only while the Admin API answers; the panel waits for this
     healthcheck:
@@ -29,7 +29,9 @@ services:
   # The management panel
   panel:
     build: .
-    image: caddy-admin:latest
+    # PANEL_IMAGE: pull the published image instead of building (see scripts/publish-images.sh), e.g.
+    #   PANEL_IMAGE=docker.can4net.com/caddy-admin:0.1.0  ->  docker compose pull panel && docker compose up -d --no-build
+    image: ${PANEL_IMAGE:-caddy-admin:latest}
     container_name: caddy-admin
     restart: unless-stopped
     depends_on:
@@ -76,7 +78,7 @@ services:
     ports:
       - "${PANEL_BIND_IP:-127.0.0.1}:${PANEL_PORT:-8181}:8181"
     volumes:
-      - panel_data:/app/data   # SQLite DB (users, hosts, uploaded cert keys)
+      - ./panel_data:/app/data   # SQLite DB (users, hosts, uploaded cert keys)
       # Docker management. NOTE: access to this socket is root-equivalent on the host.
       - ${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock
       # File manager folders: MOUNT_n_PATH in .env (unused slots mount an empty read-only dir)
@@ -98,7 +100,3 @@ networks:
   proxy:
     name: proxy
 
-volumes:
-  panel_data:
-  caddy_data:
-  caddy_config:
