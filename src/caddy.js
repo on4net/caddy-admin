@@ -15,7 +15,7 @@ const parse = (r) => ({ ...r, domains: JSON.parse(r.domains) });
  *  - letsencrypt -> ACME automation policy, internal -> Caddy local CA,
  *    custom -> uploaded PEM loaded into the tls app (ACME skipped for it).
  */
-export function buildConfig({ hosts, certs, acmeEmail, acmeCa }) {
+export function buildConfig({ hosts, certs, acmeEmail, acmeCa, panel = null }) {
   const httpRoutes = [];
   const httpsRoutes = [];
   const policies = [];
@@ -25,7 +25,8 @@ export function buildConfig({ hosts, certs, acmeEmail, acmeCa }) {
   const certById = new Map(certs.map((c) => [c.id, c]));
   const usedCerts = new Set();
 
-  for (const h of hosts.filter((x) => x.enabled)) {
+  // the panel's own domain is just another proxied host (first, so it wins any overlap)
+  for (const h of [...(panel ? [panel] : []), ...hosts].filter((x) => x.enabled)) {
     const match = [{ host: h.domains }];
     const proxy = reverseProxy(h);
     const ssl = h.ssl_mode !== 'none';
@@ -101,8 +102,21 @@ const redirectHandler = () => ({
   headers: { Location: ['https://{http.request.host}{http.request.uri}'] },
 });
 
+/** The panel's own domain (Settings -> Panel domain) as a host definition, or null if not configured. */
+export function panelHost() {
+  const domain = getSetting('panel_domain');
+  if (!domain) return null;
+  const [host, port] = (config.panelUpstream || `127.0.0.1:${config.port}`).split(/:(?=[^:]*$)/);
+  return {
+    domains: [domain], forward_scheme: 'http', forward_host: host, forward_port: Number(port) || config.port,
+    ssl_mode: getSetting('panel_ssl_mode', 'letsencrypt'), certificate_id: Number(getSetting('panel_cert_id')) || null,
+    force_ssl: getSetting('panel_force_ssl', '1') === '1', hsts: getSetting('panel_hsts', '0') === '1', enabled: 1,
+  };
+}
+
 export function loadState() {
   return {
+    panel: panelHost(),
     hosts: db.prepare('SELECT * FROM proxy_hosts ORDER BY id').all().map(parse),
     certs: db.prepare('SELECT * FROM certificates').all(),
     acmeEmail: getSetting('acme_email'),

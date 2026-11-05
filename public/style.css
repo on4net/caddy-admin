@@ -43,3 +43,6 @@ a.btn{text-decoration:none;display:inline-block}
 pre.logs{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.6rem;max-height:55vh;overflow:auto;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;margin:0}
 dialog.wide{width:min(900px,96vw)}
 td .row{flex-wrap:nowrap}
+.term{height:62vh;background:#0d1117;padding:6px;border-radius:6px;overflow:hidden}
+dialog.termdlg{width:min(1100px,97vw)}
+.logs{min-height:50vh}

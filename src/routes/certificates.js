@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db, audit } from '../db.js';
+import { db, audit, getSetting } from '../db.js';
 import { inspectCertificate } from '../certs.js';
 import { ValidationError } from '../validate.js';
 
@@ -9,7 +9,8 @@ export const certificates = Router();
 const out = (r) => ({
   id: r.id, name: r.name, domains: JSON.parse(r.domains), expires_at: r.expires_at, created_at: r.created_at,
   daysLeft: r.expires_at ? Math.floor((new Date(r.expires_at) - Date.now()) / 86_400_000) : null,
-  in_use: db.prepare('SELECT COUNT(*) c FROM proxy_hosts WHERE certificate_id=?').get(r.id).c,
+  in_use: db.prepare('SELECT COUNT(*) c FROM proxy_hosts WHERE certificate_id=?').get(r.id).c
+    + (getSetting('panel_domain') && getSetting('panel_ssl_mode') === 'custom' && Number(getSetting('panel_cert_id')) === r.id ? 1 : 0),
 });
 
 certificates.get('/', (req, res) => {

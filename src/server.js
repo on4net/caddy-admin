@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 import { db } from './db.js';
 import {
-  authenticate, tokenGuard, bootstrapAdmin, login, destroySession, sessionToken,
+  authenticate, tokenGuard, bootstrapAdmin, needsSetup, login, destroySession, sessionToken,
   setSessionCookie, clearSessionCookie, hashPassword, verifyPassword,
 } from './auth.js';
 import { applyConfig, CaddyError } from './caddy.js';
@@ -17,15 +17,19 @@ import { systemStats, systemHistory, startSampler } from './modules/system.js';
 import { docker } from './routes/docker.js';
 import { files } from './routes/files.js';
 import { tokens } from './routes/tokens.js';
+import { setup, getSetupToken } from './routes/setup.js';
 import { DockerError } from './docker.js';
+import { attachTerminal } from './terminal.js';
 
 export function createApp() {
   const app = express();
   app.disable('x-powered-by');
+  // behind Caddy: trust X-Forwarded-* from private/loopback peers only (real client IP, req.secure)
+  app.set('trust proxy', 'loopback, linklocal, uniquelocal');
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'");
+    res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:");
     next();
   });
   app.use(express.json({ limit: '256kb' }));
@@ -37,10 +41,11 @@ export function createApp() {
     next();
   });
 
+  app.use('/api/setup', setup);
   app.post('/api/login', async (req, res) => {
     const r = await login(req, req.body?.email, req.body?.password);
     if (r.error) return res.status(r.status).json({ error: r.error });
-    setSessionCookie(res, r.token);
+    setSessionCookie(res, r.token, req);
     res.json(r.user);
   });
   app.post('/api/logout', (req, res) => {
@@ -71,7 +76,11 @@ export function createApp() {
   app.use('/api', api);
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-  app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), '../public')));
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  // terminal front-end libs are served from our own origin (CSP blocks CDNs)
+  const vendor = { 'xterm.js': '@xterm/xterm/lib/xterm.js', 'xterm.css': '@xterm/xterm/css/xterm.css', 'addon-fit.js': '@xterm/addon-fit/lib/addon-fit.js' };
+  for (const [name, file] of Object.entries(vendor)) app.get(`/vendor/${name}`, (req, res) => res.sendFile(path.join(root, 'node_modules', file)));
+  app.use(express.static(path.join(root, 'public')));
 
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
@@ -87,14 +96,16 @@ export function createApp() {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const first = await bootstrapAdmin();
-  if (first) {
-    console.log('\n=== First run: admin account created ===');
-    console.log(`  email:    ${first.email}`);
-    console.log(`  password: ${first.password}${first.generated ? '   (generated - change it after login)' : ''}\n`);
+  if (first) console.log(`Admin account created from ADMIN_EMAIL: ${first.email}`);
+  else if (needsSetup()) {
+    console.log('\n=== First-time setup ===');
+    console.log(`  Open the panel in your browser (http://${config.host === '0.0.0.0' ? '127.0.0.1' : config.host}:${config.port} unless you changed the bind address)`);
+    console.log(`  and create the admin account. Setup token:  ${getSetupToken()}\n`);
   }
   if (process.env.CERT_ASK_TOKEN && process.env.CERT_ASK_TOKEN.length < 24) console.warn('CERT_ASK_TOKEN ignored: must be at least 24 characters');
   startSampler();
-  createApp().listen(config.port, config.host, () => console.log(`caddy-admin on http://${config.host}:${config.port}`));
+  const server = createApp().listen(config.port, config.host, () => console.log(`caddy-admin on http://${config.host}:${config.port}`));
+  attachTerminal(server);
   // Re-sync Caddy with DB state at startup (Caddy may have restarted empty)
   // Skipped when there are no hosts, so we never wipe a pre-existing Caddy config by accident.
   if (db.prepare('SELECT COUNT(*) c FROM proxy_hosts').get().c > 0) {

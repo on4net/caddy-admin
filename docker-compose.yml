@@ -42,6 +42,8 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       SECURE_COOKIE: ${SECURE_COOKIE:-0}
       CERT_ASK_TOKEN: ${CERT_ASK_TOKEN:-}
+      SETUP_TOKEN: ${SETUP_TOKEN:-}
+      PANEL_UPSTREAM: panel:8181   # how Caddy reaches the panel when you give it a domain (Settings -> Panel domain)
       DOCKER_SOCKET: /var/run/docker.sock
       MONITOR_DISKS: ${MONITOR_DISKS:-/|System}
       MOUNT_1_PATH: ${MOUNT_1_PATH:-}

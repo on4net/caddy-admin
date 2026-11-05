@@ -19,14 +19,20 @@ export async function verifyPassword(pw, stored) {
   return key.length === expected.length && crypto.timingSafeEqual(key, expected);
 }
 
-/** Create first admin if the DB has no users. Returns credentials info or null. */
+export const needsSetup = () => db.prepare('SELECT COUNT(*) c FROM users').get().c === 0;
+
+/**
+ * Unattended install: create the first admin from ADMIN_EMAIL + ADMIN_PASSWORD (min 8 chars).
+ * Without them nothing is created and the browser setup screen (/api/setup, guarded by a setup token) is used.
+ */
 export async function bootstrapAdmin() {
-  if (db.prepare('SELECT COUNT(*) c FROM users').get().c > 0) return null;
-  const email = process.env.ADMIN_EMAIL || 'admin@example.com';
-  const password = process.env.ADMIN_PASSWORD || crypto.randomBytes(9).toString('base64url');
+  if (!needsSetup()) return null;
+  const email = process.env.ADMIN_EMAIL, password = process.env.ADMIN_PASSWORD;
+  if (!email || !password) return null;
+  if (password.length < 8) { console.warn('ADMIN_PASSWORD ignored: must be at least 8 characters'); return null; }
   db.prepare("INSERT INTO users(email,name,password_hash,role) VALUES(?,?,?,'admin')")
     .run(email, 'Administrator', await hashPassword(password));
-  return { email, password, generated: !process.env.ADMIN_PASSWORD };
+  return { email };
 }
 
 export function createSession(userId) {
@@ -41,16 +47,17 @@ export const destroySession = (token) => db.prepare('DELETE FROM sessions WHERE 
 const parseCookies = (h = '') =>
   Object.fromEntries(h.split(';').map((c) => c.trim().split('=')).filter((p) => p[0]).map(([k, ...v]) => [k, v.join('=')]));
 
-export function setSessionCookie(res, token) {
+// Secure flag: forced by SECURE_COOKIE=1, or automatic when the request arrived over HTTPS via Caddy (X-Forwarded-Proto)
+export function setSessionCookie(res, token, req) {
   res.setHeader('Set-Cookie',
-    `sid=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${config.sessionHours * 3600}${config.secureCookie ? '; Secure' : ''}`);
+    `sid=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${config.sessionHours * 3600}${config.secureCookie || req?.secure ? '; Secure' : ''}`);
 }
 export const clearSessionCookie = (res) =>
   res.setHeader('Set-Cookie', 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
 
 export const sessionToken = (req) => parseCookies(req.headers.cookie).sid;
 
-const safeEqual = (a, b) => {
+export const safeEqual = (a, b) => {
   const x = crypto.createHash('sha256').update(a).digest(), y = crypto.createHash('sha256').update(b).digest();
   return crypto.timingSafeEqual(x, y);
 };
@@ -89,13 +96,18 @@ export function tokenGuard(req, res, next) {
   next();
 }
 
+/** The user behind the session cookie, or null. Cookie-only (used by the terminal WebSocket too). */
+export function userFromSession(req) {
+  const token = sessionToken(req);
+  return (token && db.prepare(
+    `SELECT u.id,u.email,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id
+     WHERE s.token_hash=? AND s.expires_at>? AND u.disabled=0`).get(sha256(token), Date.now())) || null;
+}
+
 export function authenticate(req, res, next) {
   const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization || '');
   if (bearer) return authenticateToken(req, res, next, bearer[1]);
-  const token = sessionToken(req);
-  const row = token && db.prepare(
-    `SELECT u.id,u.email,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id
-     WHERE s.token_hash=? AND s.expires_at>? AND u.disabled=0`).get(sha256(token), Date.now());
+  const row = userFromSession(req);
   if (!row) return res.status(401).json({ error: 'Not authenticated' });
   req.user = row;
   next();

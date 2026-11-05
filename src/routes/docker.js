@@ -2,7 +2,9 @@ import { Router } from 'express';
 import { audit } from '../db.js';
 import { requireAdmin } from '../auth.js';
 import { ValidationError } from '../validate.js';
-import { dockerRequest, dockerJson, demuxLogs, summarizeStats, selfId, DockerError } from '../docker.js';
+import { StringDecoder } from 'node:string_decoder';
+import { dockerRequest, dockerJson, dockerStream, createDemuxer, demuxLogs, summarizeStats, selfId, DockerError } from '../docker.js';
+import { cfs } from './containerfs.js';
 
 /**
  * Docker management (admin only). WARNING: access to docker.sock is root-equivalent on the host,
@@ -68,6 +70,45 @@ docker.get('/containers/:id/logs', async (req, res) => {
   const { buf } = await dockerRequest('GET', `/containers/${id}/logs?${q({ stdout: 1, stderr: 1, tail, timestamps: 1 })}`, { timeout: 15_000 });
   res.json({ logs: demuxLogs(buf, !!info.Config?.Tty) });
 });
+
+const tailParam = (v) => (v === 'all' ? 'all' : Math.min(Math.max(parseInt(v, 10) || 200, 1), 100000));
+
+// Live log follow as Server-Sent Events: each event is a JSON array of new lines. Works for stopped containers too (history, then end).
+docker.get('/containers/:id/logs/stream', async (req, res) => {
+  const id = idParam(req.params.id);
+  const info = await dockerJson('GET', `/containers/${id}/json`);
+  const src = await dockerStream('GET', `/containers/${id}/logs?${q({ stdout: 1, stderr: 1, follow: 1, tail: tailParam(req.query.tail), timestamps: 1 })}`);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  const dec = new StringDecoder('utf8'), demux = createDemuxer(!!info.Config?.Tty);
+  let carry = '';
+  const send = (event, data) => res.write(`${event ? `event: ${event}\n` : ''}data: ${JSON.stringify(data)}\n\n`);
+  demux.on('data', (b) => {
+    carry += dec.write(b);
+    const lines = carry.split('\n'); carry = lines.pop();
+    if (lines.length) send(null, lines);
+  });
+  const beat = setInterval(() => res.write(': ping\n\n'), 15_000);
+  const done = () => { clearInterval(beat); src.destroy(); };
+  src.on('end', () => { if (carry) send(null, [carry]); send('end', {}); res.end(); clearInterval(beat); });
+  src.on('error', done);
+  req.on('close', done);
+  src.pipe(demux);
+});
+
+// Download the whole log as a text file (streamed, any size)
+docker.get('/containers/:id/logs/download', async (req, res) => {
+  const id = idParam(req.params.id);
+  const info = await dockerJson('GET', `/containers/${id}/json`);
+  const src = await dockerStream('GET', `/containers/${id}/logs?${q({ stdout: 1, stderr: 1, tail: tailParam(req.query.tail || 'all'), timestamps: 1 })}`);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${(info.Name || id).replace(/[^\w.-]/g, '_')}.log"`);
+  audit(req.user.id, 'docker_logs_download', id);
+  req.on('close', () => src.destroy());
+  src.pipe(createDemuxer(!!info.Config?.Tty)).pipe(res);
+});
+
+// File manager inside a container
+docker.use('/containers/:id/fs', cfs);
 
 const ACTIONS = { start: 'start', stop: 'stop', restart: 'restart', pause: 'pause', unpause: 'unpause', kill: 'kill' };
 docker.post('/containers/:id/:action', async (req, res) => {

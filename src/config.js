@@ -11,6 +11,8 @@ export const config = {
   caddyHost: process.env.CADDY_HOST || '127.0.0.1',
   // HTTPS port Caddy serves on (used for SSL status probing)
   caddyHttpsPort: Number(process.env.CADDY_HTTPS_PORT || 443),
+  // How Caddy reaches this panel (host:port as seen from Caddy). Docker compose: panel:8181
+  panelUpstream: process.env.PANEL_UPSTREAM || '',
   sessionHours: Number(process.env.SESSION_HOURS || 12),
   secureCookie: process.env.SECURE_COOKIE === '1',
 };

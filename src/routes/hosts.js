@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { db, audit, transaction } from '../db.js';
 import { applyConfig, CaddyError } from '../caddy.js';
 import { parseProxyHost, ValidationError } from '../validate.js';
-import { coversDomain, probeCertificate } from '../certs.js';
+import { coversDomain, checkSsl } from '../certs.js';
+import { getSetting } from '../db.js';
 
 export const hosts = Router();
 
@@ -28,6 +29,8 @@ export async function mutateAndApply(fn) {
 }
 
 function checkConflicts(domains, exceptId) {
+  const pd = getSetting('panel_domain');
+  if (pd && domains.includes(pd)) throw new ValidationError(`Domain ${pd} is used by the panel itself (Settings -> Panel domain)`);
   const rows = db.prepare('SELECT id, domains FROM proxy_hosts WHERE id != ?').all(exceptId ?? -1);
   for (const r of rows) for (const d of JSON.parse(r.domains)) {
     if (domains.includes(d)) throw new ValidationError(`Domain ${d} is already used by host #${r.id}`);
@@ -127,14 +130,5 @@ hosts.get('/:id/ssl-status', async (req, res) => {
   const h = db.prepare('SELECT * FROM proxy_hosts WHERE id=?').get(Number(req.params.id));
   if (!h) return res.status(404).json({ error: 'Not found' });
   if (h.ssl_mode === 'none') return res.json({ ssl_mode: 'none', ready: true, domains: [] });
-  const domains = JSON.parse(h.domains).filter((d) => !d.startsWith('*.'));
-  const deadline = Date.now() + Math.min(Math.max(parseInt(req.query.wait, 10) || 0, 0), 180) * 1000;
-  const isReady = (r) => r.ok && r.daysLeft >= 0 && (h.ssl_mode !== 'letsencrypt' || !/Caddy Local Authority/i.test(r.issuer));
-  let results;
-  for (;;) {
-    results = await Promise.all(domains.map(async (d) => ({ domain: d, ...(await probeCertificate(d)) })));
-    if (results.every(isReady) || Date.now() + 3000 > deadline) break;
-    await new Promise((r) => setTimeout(r, 3000));
-  }
-  res.json({ ssl_mode: h.ssl_mode, ready: results.length > 0 && results.every(isReady), domains: results });
+  res.json(await checkSsl(JSON.parse(h.domains), h.ssl_mode, parseInt(req.query.wait, 10) || 0));
 });

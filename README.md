@@ -12,8 +12,14 @@ proxy hosts, SSL certificates, users - plus Docker management, server monitoring
 ```bash
 cp .env.example .env      # set CADDY_BIND_IP, ports, first admin, ...
 docker compose up -d --build
-docker compose logs panel | grep -A3 "First run"   # admin password (or set ADMIN_EMAIL/ADMIN_PASSWORD in .env)
+docker compose logs panel | grep -A3 "First-time"   # setup token
 ```
+
+Then open `http://127.0.0.1:8181`: the **setup page** asks for the setup token (from the log) and lets you choose the admin email/password and, optionally, the panel's domain. The token exists because whoever reaches an unconfigured panel first would otherwise own it. For unattended installs set `ADMIN_EMAIL` + `ADMIN_PASSWORD` in `.env` instead (and optionally `SETUP_TOKEN` to fix the token).
+
+### Panel on its own domain
+
+Settings -> **Panel domain**: give the panel a domain or subdomain (DNS A/AAAA must point at the server, ports 80/443 open) with Let's Encrypt, internal CA, a custom certificate or plain HTTP, plus Force SSL / HSTS. Caddy then proxies that domain to the panel (`PANEL_UPSTREAM`, `panel:8181` in compose); "Check SSL" / "Wait for certificate" show issuance status. The local address `http://127.0.0.1:8181` keeps working regardless, so a wrong domain or failed issuance cannot lock you out. A proxy host cannot use the panel's domain and vice versa. The session cookie becomes `Secure` automatically over HTTPS, and login throttling sees the real client IP (X-Forwarded-For from Caddy).
 
 `.env` controls which host IP/ports Caddy binds to (`CADDY_BIND_IP`, `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`), the panel's bind (`PANEL_BIND_IP`, `PANEL_PORT`), the first admin and `SECURE_COOKIE`. Caddy's Admin API is always enabled (the panel needs it; the `caddy` container is only "healthy" while it answers, and the dashboard shows its status) but is never published to the host.
 
@@ -73,7 +79,7 @@ npm install
 npm start          # http://127.0.0.1:8181
 ```
 
-First start prints the admin email/password (set `ADMIN_EMAIL` / `ADMIN_PASSWORD` to choose them).
+First start prints a setup token; open the panel and create the admin (or set `ADMIN_EMAIL` / `ADMIN_PASSWORD`).
 Caddy must be running with its admin API reachable (default `http://127.0.0.1:2019`).
 
 | Env | Default | |

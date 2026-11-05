@@ -53,3 +53,21 @@ export function probeCertificate(domain, { port = config.caddyHttpsPort, host = 
     sock.on('timeout', () => { sock.destroy(); resolve({ ok: false, error: 'timeout' }); });
   });
 }
+
+/**
+ * Probe every domain; with waitSec>0 poll until all have a usable certificate (or the time is up).
+ * ready = every domain answered with a non-expired certificate, and in letsencrypt mode not Caddy's
+ * internal fallback CA - so CI/UI can block until real issuance finished.
+ */
+export async function checkSsl(domains, sslMode, waitSec = 0) {
+  domains = domains.filter((d) => !d.startsWith('*.'));
+  const deadline = Date.now() + Math.min(Math.max(waitSec, 0), 180) * 1000;
+  const isReady = (r) => r.ok && r.daysLeft >= 0 && (sslMode !== 'letsencrypt' || !/Caddy Local Authority/i.test(r.issuer));
+  let results;
+  for (;;) {
+    results = await Promise.all(domains.map(async (d) => ({ domain: d, ...(await probeCertificate(d)) })));
+    if (results.every(isReady) || Date.now() + 3000 > deadline) break;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return { ssl_mode: sslMode, ready: results.length > 0 && results.every(isReady), domains: results };
+}

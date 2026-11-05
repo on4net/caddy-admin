@@ -18,12 +18,13 @@ async function api(method, url, body) {
     method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  if (r.status === 401 && url !== '/login') { state.user = null; render(); throw new Error('Session expired'); }
+  // '/me' is the login probe inside render(): re-rendering on its 401 would loop forever
+  if (r.status === 401 && url !== '/login' && url !== '/me') { state.user = null; render(); throw new Error('Session expired'); }
   if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   return data;
 }
 
-const state = { user: null, page: 'dashboard', dockerTab: 'containers', files: { root: null, path: '/' }, timer: null };
+const state = { notice: null, user: null, page: 'dashboard', dockerTab: 'containers', files: { root: null, path: '/', container: null }, timer: null };
 const pages = {
   dashboard: ['Dashboard', dashboard], monitor: ['Monitoring', monitorPage],
   docker: ['Docker', dockerPage, true], files: ['Files', filesPage, true],
@@ -39,7 +40,11 @@ const applyNote = (r) => (r.applied === false ? `Saved, but Caddy was not update
 async function render() {
   clearInterval(state.timer);
   if (!state.user) {
-    try { state.user = await api('GET', '/me'); } catch { return loginView(); }
+    try { state.user = await api('GET', '/me'); }
+    catch {
+      const st = await fetch('/api/setup/status').then((r) => r.json()).catch(() => ({}));
+      return st.needsSetup ? setupView() : loginView();
+    }
   }
   const nav = h('nav', null, Object.entries(pages)
     .filter(([, p]) => !p[2] || state.user.role === 'admin')
@@ -51,6 +56,45 @@ async function render() {
       h('button', { onclick: async () => { await api('POST', '/logout'); state.user = null; render(); } }, 'Logout')),
     main);
   try { await pages[state.page][1](main); } catch (e) { main.replaceChildren(flash('err', e.message)); }
+  if (state.notice) { main.prepend(flash(state.notice.kind, state.notice.text)); state.notice = null; }
+}
+
+// ---------- first-run setup ----------
+function setupView() {
+  const msg = h('div');
+  const f = {
+    token: h('input', { required: true, autocomplete: 'off', placeholder: 'printed in the panel log' }),
+    email: h('input', { type: 'email', required: true, autocomplete: 'username' }), name: h('input', { placeholder: 'Administrator' }),
+    pw: h('input', { type: 'password', required: true, minlength: 8, autocomplete: 'new-password' }), pw2: h('input', { type: 'password', required: true, autocomplete: 'new-password' }),
+    domain: h('input', { placeholder: 'panel.example.com (optional)' }),
+    ssl: h('select', null, [['letsencrypt', "Let's Encrypt (public domain)"], ['internal', 'Internal CA (LAN)'], ['none', 'No SSL (HTTP)']].map(([k, t]) => h('option', { value: k }, t))),
+  };
+  $app.replaceChildren(h('form', {
+    class: 'card login', style: 'max-width:460px', onsubmit: async (e) => {
+      e.preventDefault();
+      if (f.pw.value !== f.pw2.value) return toast(msg, 'err', 'Passwords do not match');
+      try {
+        const r = await api('POST', '/setup', {
+          token: f.token.value.trim(), email: f.email.value, name: f.name.value, password: f.pw.value,
+          panel_domain: f.domain.value.trim() || undefined, ssl_mode: f.ssl.value,
+        });
+        state.user = r.user;
+        if (f.domain.value.trim()) {
+          state.notice = r.applied
+            ? { kind: 'ok', text: `Panel domain set: ${f.ssl.value === 'none' ? 'http' : 'https'}://${f.domain.value.trim()} - make sure its DNS points to this server (ports 80/443). Check status in Settings.` }
+            : { kind: 'warn', text: `Admin created, but Caddy was not updated: ${r.warning}. Set the domain again in Settings once Caddy is running.` };
+        }
+        render();
+      } catch (err) { toast(msg, 'err', err.message); }
+    },
+  }, h('h2', null, 'Welcome - set up Caddy Admin'), msg,
+  h('p', { class: 'mut' }, 'Create the administrator account. The setup token is in the panel log: docker compose logs panel'),
+  h('label', null, 'Setup token'), f.token, h('label', null, 'Admin email'), f.email, h('label', null, 'Name (optional)'), f.name,
+  h('div', { class: 'grid' }, h('div', null, h('label', null, 'Password (min 8)'), f.pw), h('div', null, h('label', null, 'Repeat password'), f.pw2)),
+  h('h2', { style: 'margin-top:1.4rem' }, 'Panel address (optional)'),
+  h('p', { class: 'mut' }, 'Serve this panel on its own domain or subdomain. You can also do it later in Settings.'),
+  h('label', null, 'Domain / subdomain'), f.domain, h('label', null, 'SSL'), f.ssl,
+  h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { class: 'pri', style: 'width:100%' }, 'Create admin'))));
 }
 
 function loginView() {
@@ -255,6 +299,7 @@ async function settingsPage(main) {
       catch (err) { toast(pmsg, 'err', err.message); }
     } }, h('h2', null, 'Change my password'), pmsg, h('label', null, 'Current password'), cur, h('label', null, 'New password'), np,
     h('div', { style: 'margin-top:1rem' }, h('button', { class: 'pri' }, 'Change'))),
+    isAdmin && await panelDomainCard(),
     isAdmin && await tokensCard(),
     isAdmin && await auditCard());
 }
@@ -355,6 +400,8 @@ async function dockerContainers(body) {
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/stop`)) }, 'Stop'),
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/restart`)) }, 'Restart'),
             h('button', { onclick: () => logsDialog(c) }, 'Logs'),
+            c.state === 'running' && h('button', { onclick: () => terminalDialog(c) }, 'Terminal'),
+            c.state === 'running' && h('button', { onclick: () => { state.files = { root: '@c', path: '/', container: c.id }; state.page = 'files'; render(); } }, 'Files'),
             h('button', { onclick: () => detailsDialog(c) }, 'Details'),
             !c.self && h('button', { class: 'bad', onclick: () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => run(() => api('DELETE', `/docker/containers/${c.id}?force=1`))) }, 'Remove')));
       }),
@@ -367,16 +414,107 @@ async function dockerContainers(body) {
   }).catch(() => {});
 }
 
-async function logsDialog(c) {
+function logsDialog(c) {
+  const MAX = 5000; // lines kept in the browser; the Download button gets everything
   const pre = h('pre', { class: 'logs' }, 'Loading...');
-  const tail = h('select', null, [100, 200, 500, 1000, 5000].map((n) => h('option', { value: n, selected: n === 200 }, `last ${n}`)));
-  const load = async () => {
-    try { const r = await api('GET', `/docker/containers/${c.id}/logs?tail=${tail.value}`); pre.textContent = r.logs || '(no output)'; pre.scrollTop = pre.scrollHeight; }
-    catch (e) { pre.textContent = e.message; }
+  const status = h('span', { class: 'mut' });
+  const tail = h('select', null, [['100', 'last 100'], ['200', 'last 200'], ['500', 'last 500'], ['1000', 'last 1000'], ['5000', 'last 5000'], ['all', 'all (history)']]
+    .map(([v, t]) => h('option', { value: v, selected: v === '200' }, t)));
+  const live = h('input', { type: 'checkbox', checked: c.state === 'running' });
+  const wrap = h('input', { type: 'checkbox', checked: true });
+  const filter = h('input', { placeholder: 'Filter...', style: 'max-width:180px' });
+  let es = null, lines = [], stick = true, queued = false;
+
+  const draw = () => {
+    queued = false;
+    const f = filter.value.toLowerCase();
+    pre.textContent = (f ? lines.filter((l) => l.toLowerCase().includes(f)) : lines).join('\n') || '(no output)';
+    if (stick) pre.scrollTop = pre.scrollHeight;
   };
-  tail.addEventListener('change', load);
-  const d = dialog(`Logs - ${c.name}`, h('div', null, h('div', { class: 'row', style: 'margin-bottom:.6rem' }, tail, h('button', { onclick: load }, 'Refresh'), h('button', { onclick: () => d.close() }, 'Close')), pre));
-  d.classList.add('wide'); load();
+  const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(draw); } };
+  const stop = () => { es?.close(); es = null; };
+  const load = async () => {
+    stop(); lines = []; pre.textContent = 'Loading...'; stick = true;
+    if (!live.checked) { // one-shot snapshot
+      status.textContent = '';
+      try { const r = await api('GET', `/docker/containers/${c.id}/logs?tail=${tail.value === 'all' ? 5000 : tail.value}`); lines = r.logs.split('\n'); draw(); }
+      catch (e) { pre.textContent = e.message; }
+      return;
+    }
+    status.textContent = 'connecting...';
+    es = new EventSource(`/api/docker/containers/${c.id}/logs/stream?tail=${tail.value}`);
+    es.onmessage = (ev) => {
+      status.textContent = 'live';
+      lines.push(...JSON.parse(ev.data));
+      if (lines.length > MAX) lines.splice(0, lines.length - MAX);
+      schedule();
+    };
+    es.addEventListener('end', () => { stop(); status.textContent = 'stream ended (container stopped?)'; schedule(); });
+    es.onerror = () => { stop(); status.textContent = 'disconnected'; if (!lines.length) pre.textContent = 'Could not read logs (container removed or Docker unreachable).'; };
+  };
+  pre.addEventListener('scroll', () => { stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24; });
+  tail.addEventListener('change', load); live.addEventListener('change', load);
+  filter.addEventListener('input', schedule);
+  wrap.addEventListener('change', () => { pre.style.whiteSpace = wrap.checked ? 'pre-wrap' : 'pre'; });
+
+  const d = dialog(`Logs - ${c.name}`, h('div', null,
+    h('div', { class: 'row', style: 'margin-bottom:.6rem' }, tail,
+      h('label', { class: 'ck', style: 'margin:0' }, live, 'Live'), h('label', { class: 'ck', style: 'margin:0' }, wrap, 'Wrap'), filter,
+      h('a', { class: 'btn', href: `/api/docker/containers/${c.id}/logs/download` }, 'Download all'),
+      h('button', { onclick: () => { lines = []; draw(); } }, 'Clear'), status, h('button', { onclick: () => d.close() }, 'Close')),
+    pre), stop);
+  d.classList.add('wide');
+  load();
+}
+
+// ======================= Terminal (xterm.js over WebSocket -> docker exec) =======================
+let xtermLoading = null;
+function loadXterm() {
+  if (window.Terminal && window.FitAddon) return Promise.resolve();
+  xtermLoading ||= new Promise((resolve, reject) => {
+    document.head.append(h('link', { rel: 'stylesheet', href: '/vendor/xterm.css' }));
+    const load = (src) => new Promise((ok, bad) => { const s = h('script', { src }); s.onload = ok; s.onerror = () => bad(new Error(`Cannot load ${src}`)); document.head.append(s); });
+    load('/vendor/xterm.js').then(() => load('/vendor/addon-fit.js')).then(resolve, (e) => { xtermLoading = null; reject(e); });
+  });
+  return xtermLoading;
+}
+
+async function terminalDialog(c) {
+  const status = h('span', { class: 'mut' }, 'loading terminal...');
+  const holder = h('div', { class: 'term' });
+  const user = h('input', { placeholder: 'user (default: container user)', style: 'max-width:210px' });
+  const shell = h('select', null, [['auto', 'shell: auto (bash/sh)'], ['sh', 'sh'], ['bash', 'bash']].map(([v, t]) => h('option', { value: v }, t)));
+  let term = null, fit = null, ws = null;
+  const onWinResize = () => fit?.fit();
+  window.addEventListener('resize', onWinResize);
+  const d = dialog(`Terminal - ${c.name}`, h('div', null,
+    h('div', { class: 'row', style: 'margin-bottom:.6rem' }, user, shell,
+      h('button', { class: 'pri', onclick: () => connect() }, 'Reconnect'), status, h('button', { onclick: () => d.close() }, 'Close')),
+    holder), () => { window.removeEventListener('resize', onWinResize); ws?.close(); term?.dispose(); });
+  d.classList.add('wide', 'termdlg');
+
+  function connect() {
+    if (!term) return;
+    ws?.close(); term.reset(); fit.fit();
+    const q = new URLSearchParams({ cols: term.cols, rows: term.rows, shell: shell.value });
+    if (user.value.trim()) q.set('user', user.value.trim());
+    status.textContent = 'connecting...';
+    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/docker/containers/${c.id}/exec?${q}`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { status.textContent = 'connected'; term.focus(); };
+    ws.onmessage = (ev) => term.write(new Uint8Array(ev.data));
+    ws.onclose = (ev) => { status.textContent = `closed${ev.reason ? ` (${ev.reason})` : ''}`; };
+    ws.onerror = () => { status.textContent = 'connection failed (not logged in as admin, container stopped, or proxy blocks WebSocket)'; };
+  }
+
+  try { await loadXterm(); } catch (e) { status.textContent = e.message; return; }
+  term = new window.Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000, fontFamily: 'ui-monospace, Menlo, Consolas, monospace', theme: { background: '#0d1117' } });
+  fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit); term.open(holder);
+  requestAnimationFrame(() => { fit.fit(); connect(); });
+  const enc = new TextEncoder();
+  term.onData((data) => { if (ws?.readyState === 1) ws.send(enc.encode(data)); }); // keystrokes = binary frames
+  term.onResize(({ cols, rows }) => { if (ws?.readyState === 1) ws.send(JSON.stringify({ t: 'resize', cols, rows })); });
 }
 
 async function detailsDialog(c) {
@@ -451,54 +589,107 @@ async function dockerNetworks(body) {
 }
 
 // ======================= Files =======================
+// A "file system adapter" hides whether we browse a mounted host folder or the inside of a container.
+const enc = encodeURIComponent;
+const hostFs = (root) => ({
+  label: root.name, writable: root.writable,
+  list: (p) => api('GET', `/files/list?root=${root.slug}&path=${enc(p)}`),
+  dl: (p) => `/api/files/download?root=${root.slug}&path=${enc(p)}`,
+  up: (dir, name) => `/api/files/upload?root=${root.slug}&path=${enc(dir)}&name=${enc(name)}`,
+  mkdir: (dir, name) => api('POST', '/files/mkdir', { root: root.slug, path: dir, name }),
+  rename: (p, newName) => api('POST', '/files/rename', { root: root.slug, path: p, newName }),
+  del: (p) => api('DELETE', `/files?root=${root.slug}&path=${enc(p)}`),
+});
+const containerFs = (c) => {
+  const base = `/docker/containers/${c.id}/fs`;
+  return {
+    label: c.name, writable: true,
+    list: (p) => api('GET', `${base}/list?path=${enc(p)}`),
+    dl: (p) => `/api${base}/download?path=${enc(p)}`,
+    up: (dir, name) => `/api${base}/upload?path=${enc(dir)}&name=${enc(name)}`,
+    mkdir: (dir, name) => api('POST', `${base}/mkdir`, { path: dir, name }),
+    rename: (p, newName) => api('POST', `${base}/rename`, { path: p, newName }),
+    del: (p) => api('DELETE', `${base}?path=${enc(p)}`),
+  };
+};
+
 async function filesPage(main) {
   const roots = await api('GET', '/files/roots');
-  if (!roots.length) {
-    return main.replaceChildren(h('div', { class: 'card' }, h('h2', null, 'Files'),
-      h('p', null, 'No folders are mounted yet.'),
-      h('p', { class: 'mut' }, 'Set MOUNT_1_PATH (and optionally MOUNT_1_NAME, MOUNT_1_MODE=rw) in .env, then run: docker compose up -d')));
-  }
-  if (!roots.some((r) => r.slug === state.files.root)) state.files = { root: roots[0].slug, path: '/' };
-  const root = roots.find((r) => r.slug === state.files.root);
+  let sel = state.files.root;
+  if (!sel || (sel !== '@c' && !roots.some((r) => r.slug === sel))) sel = state.files.root = roots[0]?.slug || '@c';
+  const inContainer = sel === '@c';
   const msg = h('div');
+  const pick = (root) => { state.files = { root, path: '/', container: state.files.container }; render(); };
+  const tabs = h('div', { class: 'row' },
+    roots.map((r) => h('button', { class: r.slug === sel ? 'pri' : '', onclick: () => pick(r.slug) }, r.name, r.writable ? '' : ' (ro)')),
+    h('button', { class: inContainer ? 'pri' : '', onclick: () => pick('@c') }, 'Docker containers'));
+  const head = h('div', { class: 'row sp' }, h('h2', null, 'Files'), tabs);
+
+  let fsx, picker = null;
+  if (inContainer) {
+    let running = [];
+    try { running = (await api('GET', '/docker/containers')).filter((x) => x.state === 'running'); }
+    catch (e) { return main.replaceChildren(h('div', { class: 'card' }, head, flash('err', e.message))); }
+    if (!running.length) return main.replaceChildren(h('div', { class: 'card' }, head, h('p', { class: 'mut' }, 'No running containers. (Files inside a container are read through the running container.)')));
+    if (!running.some((x) => x.id === state.files.container)) state.files.container = running[0].id;
+    const c = running.find((x) => x.id === state.files.container);
+    fsx = containerFs(c);
+    picker = h('select', { onchange: (e) => { state.files.container = e.target.value; state.files.path = '/'; render(); }, style: 'max-width:260px' },
+      running.map((x) => h('option', { value: x.id, selected: x.id === c.id }, x.name)));
+  } else {
+    if (!roots.length) return main.replaceChildren(h('div', { class: 'card' }, head, h('p', null, 'No folders are mounted.'),
+      h('p', { class: 'mut' }, 'Set MOUNT_1_PATH (and optionally MOUNT_1_NAME, MOUNT_1_MODE=rw) in .env, then run: docker compose up -d')));
+    fsx = hostFs(roots.find((r) => r.slug === sel));
+  }
+
   let data;
-  try { data = await api('GET', `/files/list?root=${root.slug}&path=${encodeURIComponent(state.files.path)}`); }
-  catch (e) { state.files.path = '/'; data = { path: '/', entries: [] }; toast(msg, 'err', e.message); }
+  try { data = await fsx.list(state.files.path); state.files.ok = state.files.path; }
+  catch (e) {
+    toast(msg, 'err', e.message);
+    const back = state.files.ok || '/';
+    if (state.files.path !== back) { state.files.path = back; try { data = await fsx.list(back); } catch { /* fall through */ } }
+    data ||= { path: '/', entries: [] };
+  }
   const cur = data.path, join = (n) => (cur === '/' ? '' : cur) + '/' + n;
   const go = (p) => { state.files.path = p; render(); };
   const act = async (fn) => { try { await fn(); render(); } catch (e) { toast(msg, 'err', e.message); } };
   const crumbs = cur.split('/').filter(Boolean);
-  const url = (n) => `/api/files/download?root=${root.slug}&path=${encodeURIComponent(join(n))}`;
   const fileIn = h('input', { type: 'file', multiple: true, hidden: true });
   fileIn.addEventListener('change', async () => {
     for (const f of fileIn.files) {
       toast(msg, 'ok', `Uploading ${f.name} (${bytes(f.size)})...`);
       try {
-        const r = await fetch(`/api/files/upload?root=${root.slug}&path=${encodeURIComponent(cur)}&name=${encodeURIComponent(f.name)}`, { method: 'PUT', body: f });
+        const r = await fetch(fsx.up(cur, f.name), { method: 'PUT', body: f });
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
       } catch (e) { toast(msg, 'err', `${f.name}: ${e.message}`); return; }
     }
     render();
   });
-  main.replaceChildren(h('div', { class: 'card' },
-    h('div', { class: 'row sp' }, h('h2', null, 'Files'),
-      h('div', { class: 'row' }, roots.map((r) => h('button', { class: r.slug === root.slug ? 'pri' : '', onclick: () => { state.files = { root: r.slug, path: '/' }; render(); } }, r.name, r.writable ? '' : ' (ro)')))),
-    h('div', { class: 'row sp', style: 'margin-bottom:.6rem' },
-      h('div', null, h('a', { class: 'link', onclick: () => go('/') }, root.name), crumbs.map((c, i) => [' / ', h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, i + 1).join('/')) }, c)])),
-      root.writable ? h('div', { class: 'row' },
-        h('button', { onclick: () => promptDialog('New folder', 'Folder name', '', (v) => act(() => api('POST', '/files/mkdir', { root: root.slug, path: cur, name: v }))) }, '+ Folder'),
+
+  const nameCell = (e) => {
+    const badge = e.symlink ? h('span', { class: 'badge' }, e.target ? `link -> ${e.target}` : 'link') : null;
+    if (e.type === 'dir' || e.type === 'link') return h('td', null, h('a', { class: 'link', onclick: () => go(join(e.name)) }, (e.type === 'dir' ? '[ ] ' : '') + e.name), badge);
+    if (e.type === 'file') return h('td', null, h('a', { class: 'link', href: fsx.dl(join(e.name)) }, e.name), badge);
+    return h('td', null, e.name, badge);
+  };
+  main.replaceChildren(h('div', { class: 'card' }, head,
+    h('div', { class: 'row sp', style: 'margin:.6rem 0' },
+      h('div', { class: 'row' }, picker, h('span', null, h('a', { class: 'link', onclick: () => go('/') }, picker ? '/' : fsx.label),
+        crumbs.map((c, i) => [' / ', h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, i + 1).join('/')) }, c)]))),
+      fsx.writable ? h('div', { class: 'row' },
+        h('button', { onclick: () => promptDialog('New folder', 'Folder name', '', (v) => act(() => fsx.mkdir(cur, v))) }, '+ Folder'),
         h('button', { class: 'pri', onclick: () => fileIn.click() }, 'Upload'), fileIn)
         : h('span', { class: 'badge warn' }, 'read-only')),
+    inContainer && h('p', { class: 'mut' }, 'Browsing inside the running container (uses its ls/mkdir/mv/rm). Uploaded files are created as root, mode 0644.'),
     msg,
     h('div', { class: 'tw' }, h('table', null, th(['Name', 'Size', 'Modified', '']),
       h('tbody', null, cur !== '/' && h('tr', null, h('td', { colspan: 4 }, h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, -1).join('/')) }, '.. (up)'))),
-        data.entries.map((e) => h('tr', null,
-          h('td', null, e.type === 'dir' ? h('a', { class: 'link', onclick: () => go(join(e.name)) }, '[ ] ' + e.name) : e.type === 'file' ? h('a', { class: 'link', href: url(e.name) }, e.name) : e.name, e.symlink && h('span', { class: 'badge' }, 'link')),
+        data.entries.map((e) => h('tr', null, nameCell(e),
           h('td', null, e.size == null ? '-' : bytes(e.size)), h('td', { class: 'mut' }, e.mtime ? e.mtime.replace('T', ' ').slice(0, 16) : '-'),
           h('td', { class: 'row' },
-            e.type === 'file' && h('a', { class: 'btn', href: url(e.name) }, 'Download'),
-            root.writable && h('button', { onclick: () => promptDialog('Rename', 'New name', e.name, (v) => act(() => api('POST', '/files/rename', { root: root.slug, path: join(e.name), newName: v }))) }, 'Rename'),
-            root.writable && h('button', { class: 'bad', onclick: () => confirmDo(`Delete ${e.name}${e.type === 'dir' ? ' and everything inside it' : ''}?`, () => act(() => api('DELETE', `/files?root=${root.slug}&path=${encodeURIComponent(join(e.name))}`))) }, 'Delete')))),
+            (e.type === 'file' || e.type === 'dir' || e.type === 'link') && h('a', { class: 'btn', href: fsx.dl(join(e.name)) }, e.type === 'dir' ? 'Download .tar' : 'Download'),
+            fsx.writable && h('button', { onclick: () => promptDialog('Rename', 'New name', e.name, (v) => act(() => fsx.rename(join(e.name), v))) }, 'Rename'),
+            fsx.writable && h('button', { class: 'bad', onclick: () => confirmDo(`Delete ${e.name}${e.type === 'dir' ? ' and everything inside it' : ''}?`, () => act(() => fsx.del(join(e.name)))) }, 'Delete')))),
         data.entries.length === 0 && empty(4, 'Empty folder.'))))));
 }
 
@@ -538,6 +729,46 @@ async function tokensCard() {
       } catch (err) { toast(msg, 'err', err.message); }
     } }, h('div', { class: 'grid' }, h('div', null, h('label', null, 'Name'), name), h('div', null, h('label', null, 'Scope'), scope), h('div', null, h('label', null, 'Expires in (days, optional)'), days)),
     h('div', { style: 'margin-top:1rem' }, h('button', { class: 'pri' }, 'Create token'))));
+}
+
+
+// ---------- panel domain ----------
+async function panelDomainCard() {
+  const [p, certs] = await Promise.all([api('GET', '/settings/panel-domain'), api('GET', '/certificates')]);
+  const msg = h('div'), status = h('div');
+  const f = {
+    domain: h('input', { value: p.domain, placeholder: 'panel.example.com', required: true }),
+    ssl: h('select', null, [['letsencrypt', "Let's Encrypt (auto, public domain)"], ['internal', 'Internal CA (LAN)'], ['custom', 'Custom certificate'], ['none', 'No SSL (HTTP)']]
+      .map(([k, t]) => h('option', { value: k, selected: p.ssl_mode === k }, t))),
+    cert: h('select', null, certs.map((c) => h('option', { value: c.id, selected: p.certificate_id === c.id }, `${c.name} (${c.domains.join(', ')})`))),
+    force: h('input', { type: 'checkbox', checked: p.domain ? p.force_ssl : true }), hsts: h('input', { type: 'checkbox', checked: p.hsts }),
+  };
+  const certRow = h('div', null, h('label', null, 'Certificate'), f.cert);
+  const sslOpts = h('div', null, h('label', { class: 'ck' }, f.force, 'Force SSL (redirect HTTP to HTTPS)'), h('label', { class: 'ck' }, f.hsts, 'HSTS'));
+  const sync = () => { certRow.hidden = f.ssl.value !== 'custom'; sslOpts.hidden = f.ssl.value === 'none'; };
+  f.ssl.addEventListener('change', sync); sync();
+  const checkSsl = async (wait) => {
+    toast(status, 'ok', wait ? 'Waiting for the certificate (up to 2 min)...' : 'Checking...');
+    try {
+      const r = await api('GET', `/settings/panel-domain/ssl-status${wait ? '?wait=120' : ''}`);
+      toast(status, r.ready ? 'ok' : 'warn', r.ssl_mode === 'none' ? 'No SSL configured.' : r.domains.map((d) => d.ok ? `${d.domain}: ${d.issuer}, ${d.daysLeft} days left` : `${d.domain}: no certificate yet (${d.error}) - DNS must point to this server and ports 80/443 be open`).join(' | '));
+    } catch (e) { toast(status, 'err', e.message); }
+  };
+  return h('form', { class: 'card', onsubmit: async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api('PUT', '/settings/panel-domain', { domain: f.domain.value, ssl_mode: f.ssl.value, certificate_id: f.ssl.value === 'custom' ? Number(f.cert.value) : undefined, force_ssl: f.force.checked, hsts: f.hsts.checked });
+      toast(msg, r.applied ? 'ok' : 'warn', r.applied ? `Saved. Panel is now also served at ${r.url}` : `Saved, but Caddy was not updated: ${r.warning}`);
+    } catch (err) { toast(msg, 'err', err.message); }
+  } }, h('h2', null, 'Panel domain'),
+  h('p', { class: 'mut' }, p.domain ? `Currently served at ${p.url}.` : 'Serve this panel on a domain or subdomain through Caddy.',
+    ' The local address (http://127.0.0.1:8181) always keeps working, so a wrong setting can never lock you out.'), msg,
+  h('label', null, 'Domain / subdomain (DNS A/AAAA record must point to this server)'), f.domain, h('label', null, 'SSL'), f.ssl, certRow, sslOpts,
+  h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { class: 'pri' }, 'Save'),
+    p.domain && h('button', { type: 'button', onclick: () => checkSsl(false) }, 'Check SSL'),
+    p.domain && p.ssl_mode === 'letsencrypt' && h('button', { type: 'button', onclick: () => checkSsl(true) }, 'Wait for certificate'),
+    p.domain && h('button', { type: 'button', class: 'bad', onclick: () => confirmDo('Remove the panel domain? The panel stays reachable on its local address.', async () => { try { await api('DELETE', '/settings/panel-domain'); render(); } catch (err) { toast(msg, 'err', err.message); } }) }, 'Remove domain')),
+  status);
 }
 
 render();
