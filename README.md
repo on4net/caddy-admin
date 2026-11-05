@@ -36,9 +36,10 @@ Settings -> **Panel domain**: give the panel a domain or subdomain (DNS A/AAAA m
 
 `.env` controls which host IP/ports Caddy binds to (`CADDY_BIND_IP`, `CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`), the panel's bind (`PANEL_BIND_IP`, `PANEL_PORT`), the first admin and `SECURE_COOKIE`. Caddy's Admin API is always enabled (the panel needs it; the `caddy` container is only "healthy" while it answers, and the dashboard shows its status) but is never published to the host.
 
-- `caddy`: the official `caddy:2-alpine` image, publishing 80/443. It is configured **only** through its Admin API by the panel (`docker/caddy-bootstrap.json` just sets the admin listener).
+- `caddy`: the official `caddy:2-alpine` image, publishing 80/443. It is configured **only** through its Admin API by the panel (its tiny starting config - just the admin listener - is inline in `docker-compose.yml`, so a server only needs that file and `.env`; Docker Compose >= 2.23.1).
 - `panel`: this app, published on `127.0.0.1:8181` only. To reach it remotely add a proxy host (e.g. `panel.example.com` -> `caddy-admin:8181`, Let's Encrypt), then set `SECURE_COOKIE=1`.
 - The Admin API (2019, unauthenticated) is **not published**; it lives on the `admin` network which is `internal: true` and shared only by caddy + panel.
+- If `docker compose up` says *network proxy ... was not created by compose* / *incorrect label*, a network named `proxy` already exists on the server: set `PROXY_NETWORK_EXTERNAL=true` in `.env` to reuse it (or pick another name with `PROXY_NETWORK`). Check what is attached first: `docker network inspect proxy`.
 - To proxy other containers, attach them to the external-facing `proxy` network and use their service/container name as *Forward host*. For services on the Docker host use `host.docker.internal`.
 - Data lives in three **folders next to `docker-compose.yml`** (bind mounts, so you can back them up by copying): `panel_data/` (SQLite: users, hosts, uploaded certificate keys), `caddy_data/` (issued certificates, private keys + ACME account - keep it to avoid Let's Encrypt rate limits), `caddy_config/` (autosave used by `--resume`: Caddy comes back with the last pushed config after a restart). They contain **secrets** (git-ignored, never commit or publish them) and are owned by root; `docker compose down -v` does *not* delete them - remove the folders to reset.
 - The panel only replaces Caddy's `apps` section (`POST /config/apps`), never `admin`, so it cannot lock itself out.
@@ -65,7 +66,13 @@ GitHub Actions: store the token as a secret and run the two `curl` calls in a st
 
 ## Docker management (admin only)
 
-Containers (start / stop / restart / remove, details, live CPU+memory, **run new container** with ports/env/volumes/restart policy/network, pulls the image if missing), images (pull, remove, prune unused), volumes and networks. Talks to the Docker Engine API through the mounted socket (`DOCKER_SOCK_PATH` in `.env`).
+Containers (start / stop / restart / remove, details, live CPU+memory, **run new container** with ports/env/volumes/restart policy/network, pulls the image if missing), images (pull, remove, prune unused), volumes, networks and registry logins. Talks to the Docker Engine API through the mounted socket (`DOCKER_SOCK_PATH` in `.env`).
+
+**Networks** - the container table shows each container's networks with their IPs. *Networks* on a container shows IP, gateway, MAC and aliases per network, lets you **connect** it to another network (optional aliases and static IPv4) or **disconnect** it. The *Networks* tab lists every network (subnet/gateway, compose stack, members with IP/MAC), creates networks (name, optional subnet/gateway, internal) and removes unused ones; built-in networks (`bridge`, `host`, `none`) are protected and Docker refuses to remove a network that still has containers. The panel refuses to disconnect **itself** (it would lose Caddy and you).
+
+**Pull / Update** - per container: *Pull latest image* downloads the newest image for the container's tag and tells you whether it is newer; *Pull & update container* then replaces the container with one built from the same settings (ports, environment, volumes incl. anonymous ones, networks with aliases/static IPs, restart policy, labels - compose stacks keep working). Settings that merely came from the old image (env, cmd, labels) are not pinned, so the new image's defaults apply. Order: stop -> rename old aside -> create + start new -> delete old **without its volumes**; if the new container fails to start the old one is restored. The panel cannot replace its own container (pull, then `docker compose up -d`).
+
+**Registries** - Docker tab -> *Registries*: save a login for a private registry (e.g. your Nexus). The daemon verifies it when you save; afterwards every pull of an image from that host (Images tab, Run container, container Pull/Update) uses it automatically. The password is encrypted (AES-256-GCM, key in `panel_data/secret.key`) and is only ever sent to the matching registry host, never to Docker Hub or look-alike hosts. Protect `panel_data/` - the key is next to the database.
 
 For **any** container (running or stopped), straight from the Docker table:
 

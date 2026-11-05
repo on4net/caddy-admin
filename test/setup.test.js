@@ -66,7 +66,7 @@ test('setup with an invalid panel domain rolls back: no admin is created', async
 test('setup creates the chosen admin + panel domain, logs in, then locks itself', async () => {
   const r = await call('POST', '/setup', {
     token: 'setup-token-for-tests', email: 'boss@example.com', name: 'Boss', password: 'a-strong-pass',
-    panel_domain: 'Panel.Example.com', ssl_mode: 'letsencrypt', force_ssl: true,
+    panel_domain: 'HTTPS://Panel.Example.com/', ssl_mode: 'letsencrypt', force_ssl: true,
   });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   assert.equal(r.body.user.role, 'admin');
@@ -128,4 +128,12 @@ test('session cookie gets Secure automatically behind Caddy (X-Forwarded-Proto: 
   assert.match(r.headers.get('set-cookie'), /; Secure/);
   const plain = await fetch(base + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: creds });
   assert.doesNotMatch(plain.headers.get('set-cookie'), /Secure/);
+});
+
+test('domains: a pasted URL is reduced to the bare host name (hosts and panel domain)', async () => {
+  const r = await call('POST', '/hosts', { domains: 'https://Web.Example.com/some/path?x=1', forward_host: 'x', forward_port: 1 });
+  assert.equal(r.status, 201);
+  assert.deepEqual(r.body.domains, ['web.example.com']);
+  assert.equal((await call('POST', '/hosts', { domains: 'bad host name', forward_host: 'x', forward_port: 1 })).status, 400);
+  assert.equal((await call('POST', '/hosts', { domains: 'host.example.com:8080', forward_host: 'x', forward_port: 1 })).status, 400); // a port is not part of a domain
 });

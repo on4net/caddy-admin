@@ -66,7 +66,7 @@ function setupView() {
     token: h('input', { required: true, autocomplete: 'off', placeholder: 'printed in the panel log' }),
     email: h('input', { type: 'email', required: true, autocomplete: 'username' }), name: h('input', { placeholder: 'Administrator' }),
     pw: h('input', { type: 'password', required: true, minlength: 8, autocomplete: 'new-password' }), pw2: h('input', { type: 'password', required: true, autocomplete: 'new-password' }),
-    domain: h('input', { placeholder: 'panel.example.com (optional)' }),
+    domain: h('input', { placeholder: 'panel.example.com  (just the name, no https://)' }),
     ssl: h('select', null, [['letsencrypt', "Let's Encrypt (public domain)"], ['internal', 'Internal CA (LAN)'], ['none', 'No SSL (HTTP)']].map(([k, t]) => h('option', { value: k }, t))),
   };
   $app.replaceChildren(h('form', {
@@ -81,7 +81,7 @@ function setupView() {
         state.user = r.user;
         if (f.domain.value.trim()) {
           state.notice = r.applied
-            ? { kind: 'ok', text: `Panel domain set: ${f.ssl.value === 'none' ? 'http' : 'https'}://${f.domain.value.trim()} - make sure its DNS points to this server (ports 80/443). Check status in Settings.` }
+            ? { kind: 'ok', text: `Panel domain set: ${f.ssl.value === 'none' ? 'http' : 'https'}://${f.domain.value.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/[/?#].*$/, '')} - make sure its DNS points to this server (ports 80/443). Check status in Settings.` }
             : { kind: 'warn', text: `Admin created, but Caddy was not updated: ${r.warning}. Set the domain again in Settings once Caddy is running.` };
         }
         render();
@@ -389,14 +389,15 @@ async function dockerContainers(body) {
   const cells = {};
   body.replaceChildren(h('div', { class: 'card' },
     h('div', { class: 'row sp' }, h('h2', null, 'Containers'), h('button', { class: 'pri', onclick: () => runDialog() }, '+ Run container')), msg,
-    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Image', 'State', 'CPU / Mem', 'Ports', 'Networks', '']),
+    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Image', 'State', 'CPU / Mem', 'Ports', 'Networks']),
       h('tbody', null, list.map((c) => {
         const live = h('td', { class: 'mut' }, c.state === 'running' ? '...' : '-'); cells[c.id] = live;
-        return h('tr', null,
+        return [h('tr', { class: 'info' },
           h('td', null, h('b', null, c.name), c.self && h('span', { class: 'badge' }, 'this panel'), h('div', { class: 'mut' }, c.project ? `stack: ${c.project}` : c.id)),
           h('td', null, c.image), h('td', null, stateBadge(c.state), h('div', { class: 'mut' }, c.status)), live, h('td', null, c.ports || '-'),
-          h('td', null, c.networkInfo?.length ? c.networkInfo.map((n) => h('div', null, h('span', { class: 'badge' }, n.name), n.ip && h('span', { class: 'mut' }, ' ' + n.ip))) : '-'),
-          h('td', { class: 'row wrap' },
+          h('td', null, c.networkInfo?.length ? c.networkInfo.map((n) => h('div', null, h('span', { class: 'badge' }, n.name), n.ip && h('span', { class: 'mut' }, ' ' + n.ip))) : '-')),
+        // actions get their own full-width row, so they never get squeezed or pushed off-screen
+        h('tr', { class: 'actions' }, h('td', { colspan: 6 }, h('div', { class: 'row wrap' },
             c.state !== 'running' && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/start`)) }, 'Start'),
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/stop`)) }, 'Stop'),
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/restart`)) }, 'Restart'),
@@ -406,9 +407,9 @@ async function dockerContainers(body) {
             h('button', { onclick: () => networksDialog(c) }, 'Networks'),
             h('button', { onclick: () => updateDialog(c) }, 'Pull / Update'),
             h('button', { onclick: () => detailsDialog(c) }, 'Details'),
-            !c.self && h('button', { class: 'bad', onclick: () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => run(() => api('DELETE', `/docker/containers/${c.id}?force=1`))) }, 'Remove')));
+            !c.self && h('button', { class: 'bad', onclick: () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => run(() => api('DELETE', `/docker/containers/${c.id}?force=1`))) }, 'Remove'))))];
       }),
-      list.length === 0 && empty(7, 'No containers.'))))));
+      list.length === 0 && empty(6, 'No containers.'))))));
   // live stats are slow (~1s each, parallel): fill in after the list is on screen
   api('GET', '/docker/containers/stats').then((st) => {
     for (const [id, td] of Object.entries(cells)) {
@@ -664,23 +665,47 @@ async function dockerNetworks(body) {
       h('tbody', null, list.map((n) => h('tr', null,
         h('td', null, h('b', null, n.name), n.project && h('div', { class: 'mut' }, `stack: ${n.project}`)), h('td', null, `${n.driver} / ${n.scope}`),
         h('td', null, n.subnets.length ? n.subnets.map((s) => h('div', null, `${s.subnet}${s.gateway ? ` via ${s.gateway}` : ''}`)) : '-'),
-        h('td', null, n.containers.length, n.containers.length > 0 && h('button', { style: 'margin-left:.5rem', onclick: () => membersDialog(n) }, 'Members')),
+        h('td', null, n.containers.length, h('button', { style: 'margin-left:.5rem', onclick: () => membersDialog(n) }, 'Manage')),
         h('td', null, n.internal && h('span', { class: 'badge warn' }, 'internal'), n.builtin && h('span', { class: 'badge' }, 'built-in')),
         h('td', null, !n.builtin && h('button', { class: 'bad', disabled: n.containers.length > 0, title: n.containers.length ? 'Disconnect its containers first' : '',
           onclick: () => confirmDo(`Remove network ${n.name}?`, () => act(() => api('DELETE', `/docker/networks/${n.id}`))) }, 'Remove')))),
       list.length === 0 && empty(6, 'No networks.'))))));
 }
 
-function membersDialog(n) {
-  const msg = h('div');
-  const detach = (m) => confirmDo(`Disconnect ${m.name} from "${n.name}"?`, async () => {
-    try { await api('POST', `/docker/containers/${m.id}/networks/disconnect`, { network: n.name }); d.close(); } catch (e) { toast(msg, 'err', e.message); }
-  });
-  const d = dialog(`Containers on ${n.name}`, h('div', null, msg, h('div', { class: 'tw' }, h('table', null, th(['Container', 'IPv4', 'MAC', '']),
-    h('tbody', null, n.containers.map((m) => h('tr', null, h('td', null, h('b', null, m.name)), h('td', null, m.ipv4 || '-'), h('td', { class: 'mut' }, m.mac || '-'),
-      h('td', null, h('button', { class: 'bad', onclick: () => detach(m) }, 'Disconnect'))))))),
-    h('div', { style: 'margin-top:1rem' }, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
+function membersDialog(n0) {
+  const body = h('div', { class: 'mut' }, 'Loading...');
+  const d = dialog(`Containers on ${n0.name}`, h('div', null, body, h('div', { style: 'margin-top:1rem' }, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
   d.classList.add('wide');
+  const draw = async () => {
+    try {
+      const [n, all] = await Promise.all([api('GET', `/docker/networks/${n0.id}`), api('GET', '/docker/containers')]);
+      const msg = h('div');
+      const members = new Set(n.containers.map((m) => m.name));
+      const free = all.filter((c) => !members.has(c.name));
+      const pick = h('select', null, free.map((c) => h('option', { value: c.id }, `${c.name}${c.state === 'running' ? '' : ' (stopped)'}`)));
+      const aliases = h('input', { placeholder: 'comma separated, optional' }), ip = h('input', { placeholder: 'optional, e.g. 172.20.0.50' });
+      const detach = (m) => confirmDo(`Disconnect ${m.name} from "${n.name}"?`, async () => {
+        try { await api('POST', `/docker/containers/${m.id}/networks/disconnect`, { network: n.name }); await draw(); } catch (e) { toast(msg, 'err', e.message); }
+      });
+      const connect = async () => {
+        try { await api('POST', `/docker/containers/${pick.value}/networks/connect`, { network: n.name, aliases: aliases.value, ipv4: ip.value || undefined }); await draw(); }
+        catch (e) { toast(msg, 'err', e.message); }
+      };
+      body.replaceChildren(
+        h('div', { class: 'tw' }, h('table', null, th(['Container', 'IPv4', 'MAC', '']),
+          h('tbody', null, n.containers.map((m) => h('tr', null, h('td', null, h('b', null, m.name)), h('td', null, m.ipv4 || '-'), h('td', { class: 'mut' }, m.mac || '-'),
+            h('td', null, h('button', { class: 'bad', onclick: () => detach(m) }, 'Disconnect')))),
+          n.containers.length === 0 && empty(4, 'No containers on this network yet.')))),
+        msg,
+        h('h2', { style: 'margin-top:1.2rem' }, 'Add a container to this network'),
+        ['host', 'none'].includes(n.name) ? h('p', { class: 'mut' }, `Containers cannot be added to the "${n.name}" network this way.`)
+          : free.length
+            ? h('div', null, h('div', { class: 'grid' }, h('div', null, h('label', null, 'Container'), pick), h('div', null, h('label', null, 'Aliases'), aliases), h('div', null, h('label', null, 'Static IPv4'), ip)),
+              h('div', { style: 'margin-top:.8rem' }, h('button', { class: 'pri', onclick: connect }, 'Add to network')))
+            : h('p', { class: 'mut' }, 'Every container is already on this network.'));
+    } catch (e) { body.replaceChildren(flash('err', e.message)); }
+  };
+  draw();
 }
 
 function createNetDialog() {

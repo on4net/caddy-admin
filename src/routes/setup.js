@@ -11,7 +11,9 @@ import { savePanelDomain } from './settings.js';
  * Anyone who can reach an unconfigured panel could otherwise claim it, so the form needs the setup token
  * printed in the server log (or fixed with SETUP_TOKEN). Works only while there are zero users.
  */
-const setupToken = process.env.SETUP_TOKEN || crypto.randomBytes(12).toString('base64url');
+// SETUP_TOKEN from .env (whitespace, CR and surrounding quotes tolerated) or a random one that CHANGES on every restart
+const fromEnv = (process.env.SETUP_TOKEN || '').trim().replace(/^["']|["']$/g, '').trim();
+const setupToken = fromEnv || crypto.randomBytes(12).toString('base64url');
 export const getSetupToken = () => setupToken;
 
 export const setup = Router();
@@ -24,7 +26,7 @@ setup.post('/', async (req, res) => {
   if (recent.length >= 10) return res.status(429).json({ error: 'Too many attempts, try again later' });
   if (!safeEqual(String(req.body?.token || ''), setupToken)) {
     failures.set(req.ip, [...recent, Date.now()]);
-    return res.status(403).json({ error: 'Wrong setup token (see the panel log: docker compose logs panel)' });
+    return res.status(403).json({ error: 'Wrong setup token. It is printed in the panel log (docker compose logs panel | grep -A2 First-time) and changes every time the panel restarts - unless you fix it with SETUP_TOKEN in .env' });
   }
   const b = req.body;
   const email = parseEmail(b.email);

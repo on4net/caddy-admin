@@ -13,9 +13,12 @@ services:
       - "${CADDY_BIND_IP:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/udp"   # HTTP/3
       # The Admin API (2019, unauthenticated) is always enabled for the panel but deliberately NOT published.
     volumes:
-      - ./docker/caddy-bootstrap.json:/etc/caddy/bootstrap.json:ro
       - ./caddy_data:/data       # issued certificates + ACME account: keep it, or you hit Let's Encrypt rate limits
       - ./caddy_config:/config   # autosaved config used by --resume
+    # Caddy's starting config is inline (see configs: below), so no host file has to exist next to this compose file.
+    configs:
+      - source: caddy_bootstrap
+        target: /etc/caddy/bootstrap.json
     networks: [admin, proxy]
     # healthy only while the Admin API answers; the panel waits for this
     healthcheck:
@@ -92,11 +95,21 @@ services:
       - "${MOUNT_8_PATH:-./docker/empty}:/mnt/files/8:${MOUNT_8_MODE:-ro}"
     networks: [admin, proxy]
 
+configs:
+  # Only turns the Admin API on, reachable from the panel (internal `admin` network); everything else is pushed by the panel.
+  caddy_bootstrap:
+    content: |
+      {"admin": {"listen": "0.0.0.0:2019", "origins": ["caddy:2019", "127.0.0.1:2019", "localhost:2019"]}}
+
 networks:
   # Only caddy + panel can reach the admin API (2019). `internal` = no outside access.
   admin:
     internal: true
   # Put the containers you want to proxy on this network (use their service name as Forward host).
+  # By default compose creates it. If a network with this name already exists on the server (made by hand or by
+  # another stack - "network proxy was found but has incorrect label"), set PROXY_NETWORK_EXTERNAL=true in .env to
+  # reuse it as is (it must exist: docker network create proxy), or choose another name with PROXY_NETWORK.
   proxy:
-    name: proxy
+    name: ${PROXY_NETWORK:-proxy}
+    external: ${PROXY_NETWORK_EXTERNAL:-false}
 

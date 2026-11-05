@@ -6,7 +6,8 @@ const bad = (m) => { throw new ValidationError(m); };
 
 export function parseDomains(input) {
   const list = (Array.isArray(input) ? input : String(input || '').split(/[\s,]+/))
-    .map((d) => String(d).trim().toLowerCase()).filter(Boolean);
+    // be forgiving: a pasted URL (https://app.example.com/path) becomes the bare host name
+    .map((d) => String(d).trim().toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, '').replace(/[/?#].*$/, '').replace(/\.$/, '')).filter(Boolean);
   if (!list.length) bad('At least one domain is required');
   for (const d of list) if (!DOMAIN_RE.test(d)) bad(`Invalid domain: ${d}`);
   return [...new Set(list)];
