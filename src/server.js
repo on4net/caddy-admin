@@ -15,7 +15,8 @@ import { users } from './routes/users.js';
 import { settings } from './routes/settings.js';
 import { systemStats, systemHistory, startSampler } from './modules/system.js';
 import { docker } from './routes/docker.js';
-import { files } from './routes/files.js';
+import { fm } from './routes/fm.js';
+import { cleanTmp } from './fm/index.js';
 import { tokens } from './routes/tokens.js';
 import { setup, getSetupToken } from './routes/setup.js';
 import { DockerError } from './docker.js';
@@ -67,7 +68,7 @@ export function createApp() {
   api.get('/system', (req, res) => res.json(systemStats()));
   api.get('/system/history', (req, res) => res.json(systemHistory()));
   api.use('/docker', docker);
-  api.use('/files', files);
+  api.use('/fm', fm);
   api.use('/tokens', tokens);
   api.use('/hosts', hosts);
   api.use('/certificates', certificates);
@@ -103,6 +104,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.log(`  and create the admin account. Setup token:  ${getSetupToken()}\n`);
   }
   if (process.env.CERT_ASK_TOKEN && process.env.CERT_ASK_TOKEN.length < 24) console.warn('CERT_ASK_TOKEN ignored: must be at least 24 characters');
+  cleanTmp(); // leftovers of interrupted zip/unzip jobs
   startSampler();
   const server = createApp().listen(config.port, config.host, () => console.log(`caddy-admin on http://${config.host}:${config.port}`));
   attachTerminal(server);

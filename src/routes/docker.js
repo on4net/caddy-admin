@@ -4,7 +4,6 @@ import { requireAdmin } from '../auth.js';
 import { ValidationError } from '../validate.js';
 import { StringDecoder } from 'node:string_decoder';
 import { dockerRequest, dockerJson, dockerStream, createDemuxer, demuxLogs, summarizeStats, selfId, DockerError } from '../docker.js';
-import { cfs } from './containerfs.js';
 
 /**
  * Docker management (admin only). WARNING: access to docker.sock is root-equivalent on the host,
@@ -20,7 +19,7 @@ const idParam = (v) => { if (!ID_RE.test(v)) throw new ValidationError('Invalid 
 const isSelf = (id) => { const me = selfId(); return id.length >= 4 && (me.startsWith(id) || id.startsWith(me)); };
 const q = (o) => new URLSearchParams(o).toString();
 
-const portsText = (ports = []) => [...new Set(ports.map((p) =>
+const portsText = (ports) => [...new Set((ports || []).map((p) =>
   p.PublicPort ? `${p.IP && p.IP !== '0.0.0.0' && p.IP !== '::' ? p.IP + ':' : ''}${p.PublicPort}->${p.PrivatePort}/${p.Type}` : `${p.PrivatePort}/${p.Type}`))].join(', ');
 
 docker.get('/info', async (req, res) => {
@@ -106,9 +105,6 @@ docker.get('/containers/:id/logs/download', async (req, res) => {
   req.on('close', () => src.destroy());
   src.pipe(createDemuxer(!!info.Config?.Tty)).pipe(res);
 });
-
-// File manager inside a container
-docker.use('/containers/:id/fs', cfs);
 
 const ACTIONS = { start: 'start', stop: 'stop', restart: 'restart', pause: 'pause', unpause: 'unpause', kill: 'kill' };
 docker.post('/containers/:id/:action', async (req, res) => {

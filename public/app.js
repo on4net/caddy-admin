@@ -24,7 +24,7 @@ async function api(method, url, body) {
   return data;
 }
 
-const state = { notice: null, user: null, page: 'dashboard', dockerTab: 'containers', files: { root: null, path: '/', container: null }, timer: null };
+const state = { notice: null, user: null, page: 'dashboard', dockerTab: 'containers', files: { src: null, path: '/' }, clip: null, timer: null };
 const pages = {
   dashboard: ['Dashboard', dashboard], monitor: ['Monitoring', monitorPage],
   docker: ['Docker', dockerPage, true], files: ['Files', filesPage, true],
@@ -401,7 +401,7 @@ async function dockerContainers(body) {
             c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/restart`)) }, 'Restart'),
             h('button', { onclick: () => logsDialog(c) }, 'Logs'),
             c.state === 'running' && h('button', { onclick: () => terminalDialog(c) }, 'Terminal'),
-            c.state === 'running' && h('button', { onclick: () => { state.files = { root: '@c', path: '/', container: c.id }; state.page = 'files'; render(); } }, 'Files'),
+            c.state === 'running' && h('button', { onclick: () => { state.files = { src: 'container:' + c.id, path: '/', lastContainer: 'container:' + c.id }; state.page = 'files'; render(); } }, 'Files'),
             h('button', { onclick: () => detailsDialog(c) }, 'Details'),
             !c.self && h('button', { class: 'bad', onclick: () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => run(() => api('DELETE', `/docker/containers/${c.id}?force=1`))) }, 'Remove')));
       }),
@@ -589,108 +589,231 @@ async function dockerNetworks(body) {
 }
 
 // ======================= Files =======================
-// A "file system adapter" hides whether we browse a mounted host folder or the inside of a container.
-const enc = encodeURIComponent;
-const hostFs = (root) => ({
-  label: root.name, writable: root.writable,
-  list: (p) => api('GET', `/files/list?root=${root.slug}&path=${enc(p)}`),
-  dl: (p) => `/api/files/download?root=${root.slug}&path=${enc(p)}`,
-  up: (dir, name) => `/api/files/upload?root=${root.slug}&path=${enc(dir)}&name=${enc(name)}`,
-  mkdir: (dir, name) => api('POST', '/files/mkdir', { root: root.slug, path: dir, name }),
-  rename: (p, newName) => api('POST', '/files/rename', { root: root.slug, path: p, newName }),
-  del: (p) => api('DELETE', `/files?root=${root.slug}&path=${enc(p)}`),
-});
-const containerFs = (c) => {
-  const base = `/docker/containers/${c.id}/fs`;
-  return {
-    label: c.name, writable: true,
-    list: (p) => api('GET', `${base}/list?path=${enc(p)}`),
-    dl: (p) => `/api${base}/download?path=${enc(p)}`,
-    up: (dir, name) => `/api${base}/upload?path=${enc(dir)}&name=${enc(name)}`,
-    mkdir: (dir, name) => api('POST', `${base}/mkdir`, { path: dir, name }),
-    rename: (p, newName) => api('POST', `${base}/rename`, { path: p, newName }),
-    del: (p) => api('DELETE', `${base}?path=${enc(p)}`),
+// ======================= File manager (host folders + inside containers, one UI) =======================
+const fq = (o) => new URLSearchParams(o).toString();
+const pad2 = (n) => String(n).padStart(2, '0');
+const fmtTime = (ms) => { if (!ms) return '-'; const d = new Date(ms); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|ico)$/i;
+const isZip = (n) => /\.zip$/i.test(n);
+const joinPath = (dir, name) => (dir === '/' ? '' : dir) + '/' + name;
+
+function xhrPut(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', url);
+    x.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
+    x.onload = () => {
+      if (x.status >= 200 && x.status < 300) return resolve();
+      let m = `HTTP ${x.status}`; try { m = JSON.parse(x.responseText).error || m; } catch { /* keep */ }
+      reject(new Error(m));
+    };
+    x.onerror = () => reject(new Error('Network error'));
+    x.send(file);
+  });
+}
+
+/** Files dropped on the page: walks dropped folders (webkitGetAsEntry) -> {files:[{file,rel}], dirs:[rel]} */
+async function collectDropped(dt) {
+  const entries = [...dt.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean); // must be read synchronously
+  const out = { files: [], dirs: [] };
+  const walk = async (entry, relDir) => {
+    if (entry.isFile) { out.files.push({ file: await new Promise((res, rej) => entry.file(res, rej)), rel: relDir }); return; }
+    const mine = relDir ? `${relDir}/${entry.name}` : entry.name;
+    out.dirs.push(mine);
+    const reader = entry.createReader();
+    for (;;) {
+      const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+      if (!batch.length) break;
+      for (const e of batch) await walk(e, mine);
+    }
   };
-};
+  for (const e of entries) await walk(e, '');
+  return out;
+}
 
 async function filesPage(main) {
-  const roots = await api('GET', '/files/roots');
-  let sel = state.files.root;
-  if (!sel || (sel !== '@c' && !roots.some((r) => r.slug === sel))) sel = state.files.root = roots[0]?.slug || '@c';
-  const inContainer = sel === '@c';
-  const msg = h('div');
-  const pick = (root) => { state.files = { root, path: '/', container: state.files.container }; render(); };
-  const tabs = h('div', { class: 'row' },
-    roots.map((r) => h('button', { class: r.slug === sel ? 'pri' : '', onclick: () => pick(r.slug) }, r.name, r.writable ? '' : ' (ro)')),
-    h('button', { class: inContainer ? 'pri' : '', onclick: () => pick('@c') }, 'Docker containers'));
-  const head = h('div', { class: 'row sp' }, h('h2', null, 'Files'), tabs);
-
-  let fsx, picker = null;
-  if (inContainer) {
-    let running = [];
-    try { running = (await api('GET', '/docker/containers')).filter((x) => x.state === 'running'); }
-    catch (e) { return main.replaceChildren(h('div', { class: 'card' }, head, flash('err', e.message))); }
-    if (!running.length) return main.replaceChildren(h('div', { class: 'card' }, head, h('p', { class: 'mut' }, 'No running containers. (Files inside a container are read through the running container.)')));
-    if (!running.some((x) => x.id === state.files.container)) state.files.container = running[0].id;
-    const c = running.find((x) => x.id === state.files.container);
-    fsx = containerFs(c);
-    picker = h('select', { onchange: (e) => { state.files.container = e.target.value; state.files.path = '/'; render(); }, style: 'max-width:260px' },
-      running.map((x) => h('option', { value: x.id, selected: x.id === c.id }, x.name)));
-  } else {
-    if (!roots.length) return main.replaceChildren(h('div', { class: 'card' }, head, h('p', null, 'No folders are mounted.'),
-      h('p', { class: 'mut' }, 'Set MOUNT_1_PATH (and optionally MOUNT_1_NAME, MOUNT_1_MODE=rw) in .env, then run: docker compose up -d')));
-    fsx = hostFs(roots.find((r) => r.slug === sel));
+  const S = await api('GET', '/fm/sources');
+  const f = state.files;
+  f.sel ||= new Set(); f.sort ||= { key: 'name', dir: 1 };
+  const hosts = S.hosts, ctrs = S.containers;
+  const inCt = f.src?.startsWith('container:');
+  if (!f.src || (!inCt && !hosts.some((h) => h.id === f.src)) || (inCt && !ctrs.some((c) => c.id === f.src))) {
+    f.src = hosts[0]?.id || ctrs[0]?.id || null; f.path = '/'; f.ok = null;
   }
+  const containerMode = f.src?.startsWith('container:');
+  const pickSrc = (src) => { state.files = { ...f, src, path: '/', ok: null, sel: new Set() }; render(); };
+  const msg = h('div');
+  const tabs = h('div', { class: 'row' },
+    hosts.map((x) => h('button', { class: x.id === f.src ? 'pri' : '', onclick: () => pickSrc(x.id) }, x.name, x.writable ? '' : ' (ro)')),
+    h('button', { class: containerMode ? 'pri' : '', onclick: () => ctrs.length ? pickSrc(f.lastContainer && ctrs.some((c) => c.id === f.lastContainer) ? f.lastContainer : ctrs[0].id) : toast(msg, 'warn', S.dockerError || 'No running containers') }, 'Docker containers'));
+  const head = h('div', { class: 'row sp' }, h('h2', null, 'Files'), tabs);
+  if (!f.src) {
+    return main.replaceChildren(h('div', { class: 'card' }, head, h('p', null, 'No folders are mounted and no containers are running.'),
+      h('p', { class: 'mut' }, 'Set MOUNT_1_PATH (and optionally MOUNT_1_NAME, MOUNT_1_MODE=rw) in .env, then run: docker compose up -d'), msg));
+  }
+  if (containerMode) f.lastContainer = f.src;
+  const src = f.src;
 
   let data;
-  try { data = await fsx.list(state.files.path); state.files.ok = state.files.path; }
+  try { data = await api('GET', `/fm/list?${fq({ src, path: f.path })}`); f.ok = f.path; }
   catch (e) {
     toast(msg, 'err', e.message);
-    const back = state.files.ok || '/';
-    if (state.files.path !== back) { state.files.path = back; try { data = await fsx.list(back); } catch { /* fall through */ } }
-    data ||= { path: '/', entries: [] };
+    if (f.ok && f.ok !== f.path) { f.path = f.ok; try { data = await api('GET', `/fm/list?${fq({ src, path: f.path })}`); } catch { /* below */ } }
+    data ||= { path: '/', entries: [], source: { id: src, label: src, writable: false } };
   }
-  const cur = data.path, join = (n) => (cur === '/' ? '' : cur) + '/' + n;
-  const go = (p) => { state.files.path = p; render(); };
-  const act = async (fn) => { try { await fn(); render(); } catch (e) { toast(msg, 'err', e.message); } };
+  const cur = data.path, writable = data.source.writable;
+  const go = (p) => { f.path = p; f.sel = new Set(); render(); };
+  const act = async (fn, okText) => { try { const r = await fn(); if (okText) state.notice = { kind: 'ok', text: okText(r) }; render(); } catch (e) { toast(msg, 'err', e.message); } };
   const crumbs = cur.split('/').filter(Boolean);
-  const fileIn = h('input', { type: 'file', multiple: true, hidden: true });
-  fileIn.addEventListener('change', async () => {
-    for (const f of fileIn.files) {
-      toast(msg, 'ok', `Uploading ${f.name} (${bytes(f.size)})...`);
-      try {
-        const r = await fetch(fsx.up(cur, f.name), { method: 'PUT', body: f });
-        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
-      } catch (e) { toast(msg, 'err', `${f.name}: ${e.message}`); return; }
-    }
-    render();
+  const sel = () => data.entries.filter((e) => f.sel.has(e.name));
+  const selPaths = () => sel().map((e) => joinPath(cur, e.name));
+  const enc = encodeURIComponent;
+  const dlUrl = (name, inline) => `/api/fm/download?${fq({ src, path: joinPath(cur, name), ...(inline ? { inline: 1 } : {}) })}`;
+
+  // ---- sorting
+  const key = f.sort.key;
+  const entries = [...data.entries].sort((a, b) => {
+    if ((a.type === 'dir') !== (b.type === 'dir')) return a.type === 'dir' ? -1 : 1;
+    const va = key === 'name' ? a.name.toLowerCase() : (a[key] ?? -1), vb = key === 'name' ? b.name.toLowerCase() : (b[key] ?? -1);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * f.sort.dir;
   });
+  const sortTh = (label, k) => h('th', { style: 'cursor:pointer', onclick: () => { f.sort = { key: k, dir: f.sort.key === k ? -f.sort.dir : 1 }; render(); } }, label, f.sort.key === k ? (f.sort.dir > 0 ? ' ▲' : ' ▼') : '');
+
+  // ---- upload (files and whole folders, with progress)
+  const progress = h('div');
+  const overwrite = h('input', { type: 'checkbox', checked: !!f.overwrite, onchange: (e) => { f.overwrite = e.target.checked; } });
+  async function upload({ files, dirs = [] }) {
+    const need = new Set(dirs);
+    for (const it of files) { const parts = it.rel.split('/').filter(Boolean); for (let i = 1; i <= parts.length; i++) need.add(parts.slice(0, i).join('/')); }
+    for (const d of [...need].sort((a, b) => a.split('/').length - b.split('/').length)) { // parents first
+      const parts = d.split('/');
+      await api('POST', '/fm/mkdir', { src, path: joinPath(cur, parts.slice(0, -1).join('/')).replace(/\/$/, '') || '/', name: parts.at(-1), existOk: true });
+    }
+    const errors = []; let n = 0;
+    for (const it of files) {
+      n++;
+      const dir = it.rel ? joinPath(cur, it.rel) : cur;
+      try {
+        await xhrPut(`/api/fm/upload?${fq({ src, path: dir, name: it.file.name, ...(f.overwrite ? { overwrite: 1 } : {}) })}`, it.file,
+          (p) => progress.replaceChildren(h('div', { class: 'msg ok' }, `Uploading ${n}/${files.length}: ${it.file.name} - ${p}%`, h('div', { class: 'bar' }, h('i', { style: `width:${p}%` })))));
+      } catch (e) { errors.push(`${it.file.name}: ${e.message}`); }
+    }
+    state.notice = errors.length ? { kind: 'warn', text: `Uploaded ${files.length - errors.length}/${files.length}. ${errors.slice(0, 3).join(' | ')}${errors.length > 3 ? ' ...' : ''}` } : { kind: 'ok', text: `Uploaded ${files.length} file(s).` };
+    render();
+  }
+  const run = (p) => p.catch((e) => toast(msg, 'err', e.message));
+  const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: (e) => run(upload({ files: [...e.target.files].map((file) => ({ file, rel: '' })) })) });
+  const dirIn = h('input', { type: 'file', hidden: true, webkitdirectory: true, onchange: (e) => run(upload({ files: [...e.target.files].map((file) => ({ file, rel: (file.webkitRelativePath || '').split('/').slice(0, -1).join('/') })) })) });
+
+  // ---- clipboard (copy / cut -> paste in any folder or source)
+  const clip = state.clip;
+  const setClip = (mode) => { state.clip = { mode, src, label: data.source.label, dir: cur, paths: selPaths() }; f.sel = new Set(); render(); };
+  const paste = () => act(async () => {
+    const r = await api('POST', '/fm/transfer', { mode: clip.mode === 'cut' ? 'move' : 'copy', from: { src: clip.src, paths: clip.paths }, to: { src, path: cur } });
+    if (clip.mode === 'cut') state.clip = null;
+    return r;
+  }, (r) => `${clip.mode === 'cut' ? 'Moved' : 'Copied'} ${r.done.length} item(s).`);
+
+  // ---- actions on selection
+  const zipSel = () => {
+    const paths = selPaths(), one = sel().length === 1 ? sel()[0].name : (crumbs.at(-1) || 'archive');
+    promptDialog('Create zip', 'Archive name', one.replace(/\.zip$/i, '') + '.zip', (name) => act(() => api('POST', '/fm/zip', { src, path: cur, paths, name }), (r) => `Created ${r.name}`));
+  };
+  const delSel = () => confirmDo(`Delete ${sel().length} selected item(s)? Folders are deleted with everything inside.`, () => act(() => api('POST', '/fm/delete', { src, paths: selPaths() }), (r) => `Deleted ${r.deleted} item(s).`));
+  const unzipDialog = (e) => {
+    const mode = h('select', null, h('option', { value: 'here' }, 'Extract here'), h('option', { value: 'folder' }, `Extract into a new folder "${e.name.replace(/\.zip$/i, '')}"`));
+    const ow = h('input', { type: 'checkbox' });
+    const d = dialog(`Unzip ${e.name}`, h('div', null, h('label', null, 'Where'), mode, h('label', { class: 'ck' }, ow, 'Overwrite existing files'),
+      h('div', { class: 'row', style: 'margin-top:1rem' },
+        h('button', { class: 'pri', onclick: () => { d.close(); act(() => api('POST', '/fm/unzip', { src, path: joinPath(cur, e.name), dest: cur, folder: mode.value === 'folder', overwrite: ow.checked }),
+          (r) => `Extracted ${r.files} file(s)${r.skipped?.length ? `, skipped ${r.skipped.length} unsafe entr${r.skipped.length > 1 ? 'ies' : 'y'}` : ''}.`); } }, 'Unzip'),
+        h('button', { onclick: () => d.close() }, 'Cancel'))));
+  };
 
   const nameCell = (e) => {
     const badge = e.symlink ? h('span', { class: 'badge' }, e.target ? `link -> ${e.target}` : 'link') : null;
-    if (e.type === 'dir' || e.type === 'link') return h('td', null, h('a', { class: 'link', onclick: () => go(join(e.name)) }, (e.type === 'dir' ? '[ ] ' : '') + e.name), badge);
-    if (e.type === 'file') return h('td', null, h('a', { class: 'link', href: fsx.dl(join(e.name)) }, e.name), badge);
+    const p = joinPath(cur, e.name);
+    if (e.type === 'dir' || e.type === 'link') return h('td', null, h('a', { class: 'link', onclick: () => go(p) }, (e.type === 'dir' ? '[ ] ' : '') + e.name), badge);
+    if (e.type === 'file') return h('td', null, h('a', { class: 'link', onclick: () => openViewer(e) }, e.name), badge);
     return h('td', null, e.name, badge);
   };
-  main.replaceChildren(h('div', { class: 'card' }, head,
+  function openViewer(e) {
+    const p = joinPath(cur, e.name);
+    const close = h('button', { onclick: () => d.close() }, 'Close');
+    const dl = h('a', { class: 'btn', href: dlUrl(e.name) }, 'Download');
+    const body = h('div', { class: 'mut' }, 'Loading...');
+    const d = dialog(e.name, h('div', null, body, h('div', { class: 'row', style: 'margin-top:1rem' }, dl, close)));
+    d.classList.add('wide');
+    if (IMG_RE.test(e.name)) return body.replaceChildren(h('img', { src: dlUrl(e.name, true), style: 'max-width:100%;max-height:70vh;display:block;margin:auto' }));
+    if (/\.pdf$/i.test(e.name)) return body.replaceChildren(h('a', { class: 'btn pri', href: dlUrl(e.name, true), target: '_blank', rel: 'noopener' }, 'Open PDF in a new tab'));
+    api('GET', `/fm/read?${fq({ src, path: p })}`).then((r) => {
+      const ta = h('textarea', { class: 'editor', spellcheck: false, readonly: !r.writable }, r.content);
+      const st = h('span', { class: 'mut' }, `${bytes(r.size)}${r.writable ? '' : ' - read-only'}`);
+      const save = h('button', { class: 'pri', disabled: !r.writable, onclick: async () => {
+        save.disabled = true;
+        try {
+          const res = await fetch(`/api/fm/write?${fq({ src, path: p })}`, { method: 'PUT', headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: ta.value });
+          if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+          st.textContent = `Saved ${new Date().toLocaleTimeString()}`; st.style.color = 'var(--pri)';
+        } catch (err) { st.textContent = err.message; st.style.color = 'var(--bad)'; }
+        save.disabled = !r.writable;
+      } }, 'Save');
+      ta.addEventListener('keydown', (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 's') { ev.preventDefault(); save.click(); } });
+      ta.addEventListener('input', () => { st.textContent = 'Modified (Ctrl+S to save)'; st.style.color = 'var(--warn)'; });
+      body.replaceChildren(ta, h('div', { class: 'row', style: 'margin-top:.5rem' }, save, st));
+      close.before(save, st); // keep Save reachable without scrolling
+      body.querySelector('.row')?.remove();
+    }, (err) => body.replaceChildren(flash(err.message.includes('binary') ? 'warn' : 'err', err.message)));
+  }
+
+  const allBox = h('input', { type: 'checkbox', checked: entries.length > 0 && entries.every((e) => f.sel.has(e.name)), onchange: (ev) => { f.sel = ev.target.checked ? new Set(entries.map((e) => e.name)) : new Set(); render(); } });
+  const card = h('div', { class: 'card', id: 'fm-card' }, head,
     h('div', { class: 'row sp', style: 'margin:.6rem 0' },
-      h('div', { class: 'row' }, picker, h('span', null, h('a', { class: 'link', onclick: () => go('/') }, picker ? '/' : fsx.label),
-        crumbs.map((c, i) => [' / ', h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, i + 1).join('/')) }, c)]))),
-      fsx.writable ? h('div', { class: 'row' },
-        h('button', { onclick: () => promptDialog('New folder', 'Folder name', '', (v) => act(() => fsx.mkdir(cur, v))) }, '+ Folder'),
-        h('button', { class: 'pri', onclick: () => fileIn.click() }, 'Upload'), fileIn)
-        : h('span', { class: 'badge warn' }, 'read-only')),
-    inContainer && h('p', { class: 'mut' }, 'Browsing inside the running container (uses its ls/mkdir/mv/rm). Uploaded files are created as root, mode 0644.'),
-    msg,
-    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Size', 'Modified', '']),
-      h('tbody', null, cur !== '/' && h('tr', null, h('td', { colspan: 4 }, h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, -1).join('/')) }, '.. (up)'))),
-        data.entries.map((e) => h('tr', null, nameCell(e),
-          h('td', null, e.size == null ? '-' : bytes(e.size)), h('td', { class: 'mut' }, e.mtime ? e.mtime.replace('T', ' ').slice(0, 16) : '-'),
-          h('td', { class: 'row' },
-            (e.type === 'file' || e.type === 'dir' || e.type === 'link') && h('a', { class: 'btn', href: fsx.dl(join(e.name)) }, e.type === 'dir' ? 'Download .tar' : 'Download'),
-            fsx.writable && h('button', { onclick: () => promptDialog('Rename', 'New name', e.name, (v) => act(() => fsx.rename(join(e.name), v))) }, 'Rename'),
-            fsx.writable && h('button', { class: 'bad', onclick: () => confirmDo(`Delete ${e.name}${e.type === 'dir' ? ' and everything inside it' : ''}?`, () => act(() => fsx.del(join(e.name)))) }, 'Delete')))),
-        data.entries.length === 0 && empty(4, 'Empty folder.'))))));
+      h('div', { class: 'row' },
+        containerMode && h('select', { onchange: (ev) => pickSrc(ev.target.value), style: 'max-width:260px' }, ctrs.map((c) => h('option', { value: c.id, selected: c.id === src }, c.name))),
+        h('span', null, h('a', { class: 'link', onclick: () => go('/') }, containerMode ? '/' : data.source.label), crumbs.map((c, i) => [' / ', h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, i + 1).join('/')) }, c)]))),
+      h('div', { class: 'row' },
+        writable && [
+          h('button', { onclick: () => promptDialog('New folder', 'Folder name', '', (v) => act(() => api('POST', '/fm/mkdir', { src, path: cur, name: v }))) }, '+ Folder'),
+          h('button', { onclick: () => promptDialog('New file', 'File name', '', (v) => act(() => api('POST', '/fm/mkfile', { src, path: cur, name: v }))) }, '+ File'),
+          h('button', { class: 'pri', onclick: () => fileIn.click() }, 'Upload files'), h('button', { onclick: () => dirIn.click() }, 'Upload folder'),
+          h('label', { class: 'ck', style: 'margin:0' }, overwrite, 'overwrite'), fileIn, dirIn],
+        clip && writable && h('button', { class: 'pri', onclick: paste }, `Paste ${clip.paths.length} (${clip.mode === 'cut' ? 'move' : 'copy'})`),
+        !writable && h('span', { class: 'badge warn' }, 'read-only'),
+        h('button', { onclick: () => render() }, 'Refresh'))),
+    clip && h('div', { class: 'msg', style: 'padding:.4rem .8rem' }, `Clipboard: ${clip.mode} ${clip.paths.length} item(s) from ${clip.label}:${clip.dir} - open any folder (even another source) and press Paste. `,
+      h('a', { class: 'link', onclick: () => { state.clip = null; render(); } }, 'clear')),
+    f.sel.size > 0 && h('div', { class: 'row msg', style: 'padding:.4rem .8rem' }, h('b', null, `${f.sel.size} selected`),
+      h('button', { onclick: () => setClip('copy') }, 'Copy'), writable && h('button', { onclick: () => setClip('cut') }, 'Cut'),
+      writable && h('button', { onclick: zipSel }, 'Zip'), writable && h('button', { class: 'bad', onclick: delSel }, 'Delete'),
+      h('button', { onclick: () => { f.sel = new Set(); render(); } }, 'Clear selection')),
+    containerMode && h('p', { class: 'mut' }, 'Inside the running container (uses its ls/stat/mkdir/mv/cp/rm; zip and unzip are done by the panel). New files are created as root unless you edit an existing one (owner and permissions are kept).'),
+    msg, progress,
+    h('div', { class: 'tw' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', { style: 'width:1.5rem' }, allBox), sortTh('Name', 'name'), sortTh('Size', 'size'), sortTh('Created', 'birth'), sortTh('Modified', 'mtime'), h('th', null, 'Permissions'), h('th', null, ''))),
+      h('tbody', null, cur !== '/' && h('tr', null, h('td'), h('td', { colspan: 6 }, h('a', { class: 'link', onclick: () => go('/' + crumbs.slice(0, -1).join('/')) }, '.. (up)'))),
+        entries.map((e) => {
+          const p = joinPath(cur, e.name);
+          return h('tr', null,
+            h('td', null, h('input', { type: 'checkbox', checked: f.sel.has(e.name), onchange: (ev) => { ev.target.checked ? f.sel.add(e.name) : f.sel.delete(e.name); render(); } })),
+            nameCell(e), h('td', null, e.size == null ? '-' : bytes(e.size)),
+            h('td', { class: 'mut', title: e.birth ? '' : 'Creation time is not recorded by this filesystem' }, fmtTime(e.birth)),
+            h('td', { class: 'mut' }, e.mtime ? fmtTime(e.mtime) : (e.mtimeText || '-')),
+            h('td', { class: 'mut' }, e.mode || '-', e.owner ? ` ${e.owner}` : ''),
+            h('td', { class: 'row' },
+              e.type === 'file' && h('button', { onclick: () => openViewer(e) }, 'View'),
+              (e.type === 'file' || e.type === 'dir' || e.type === 'link') && h('a', { class: 'btn', href: dlUrl(e.name) }, e.type === 'dir' ? '.tar' : 'Download'),
+              writable && h('button', { onclick: () => promptDialog('Rename', 'New name', e.name, (v) => act(() => api('POST', '/fm/rename', { src, path: p, newName: v }))) }, 'Rename'),
+              writable && e.type === 'file' && isZip(e.name) && h('button', { onclick: () => unzipDialog(e) }, 'Unzip'),
+              writable && h('button', { class: 'bad', onclick: () => confirmDo(`Delete ${e.name}${e.type === 'dir' ? ' and everything inside it' : ''}?`, () => act(() => api('POST', '/fm/delete', { src, paths: [p] }))) }, 'Delete')));
+        }),
+        entries.length === 0 && empty(7, 'Empty folder. Drop files or folders here to upload.')))));
+  if (writable) { // drag & drop upload (files and folders)
+    card.addEventListener('dragover', (ev) => { ev.preventDefault(); card.classList.add('drop'); });
+    card.addEventListener('dragleave', (ev) => { if (ev.target === card) card.classList.remove('drop'); });
+    card.addEventListener('drop', (ev) => { ev.preventDefault(); card.classList.remove('drop'); collectDropped(ev.dataTransfer).then((items) => (items.files.length || items.dirs.length) && upload(items)).catch((e) => toast(msg, 'err', e.message)); });
+  }
+  main.replaceChildren(card);
 }
 
 function promptDialog(title, label, value, onOk) {

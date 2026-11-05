@@ -79,19 +79,32 @@ export function validName(name) {
   return n;
 }
 
+/** rwxr-xr-x style string from an fs mode */
+export function modeString(mode, isDir) {
+  const r = 'rwxrwxrwx'; let out = isDir ? 'd' : '-';
+  for (let i = 0; i < 9; i++) out += mode & (1 << (8 - i)) ? r[i] : '-';
+  return out;
+}
+
 export function listDir(root, rel) {
   const { base, abs } = safePath(root, rel);
   if (!fs.statSync(abs).isDirectory()) throw new ValidationError('Not a directory');
   const entries = [];
   for (const d of fs.readdirSync(abs, { withFileTypes: true })) {
-    let st;
-    try { st = fs.statSync(path.join(abs, d.name)); } catch { st = null; } // broken symlink
+    const full = path.join(abs, d.name);
+    let st, lst;
+    try { lst = fs.lstatSync(full); } catch { continue; } // vanished
+    try { st = fs.statSync(full); } catch { st = null; } // broken symlink
+    const isDir = !!st?.isDirectory();
     entries.push({
       name: d.name,
-      type: st?.isDirectory() ? 'dir' : st ? 'file' : 'broken',
-      symlink: d.isSymbolicLink(),
+      type: isDir ? 'dir' : st?.isFile() ? 'file' : st ? 'special' : 'broken',
+      symlink: lst.isSymbolicLink(),
+      target: lst.isSymbolicLink() ? (() => { try { return fs.readlinkSync(full); } catch { return null; } })() : null,
       size: st?.isFile() ? st.size : null,
-      mtime: st ? st.mtime.toISOString() : null,
+      mtime: (st || lst).mtimeMs,
+      birth: (st || lst).birthtimeMs > 0 ? (st || lst).birthtimeMs : null, // null when the filesystem has no creation time
+      mode: modeString((st || lst).mode, isDir),
     });
   }
   entries.sort((a, b) => (a.type === 'dir') === (b.type === 'dir') ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1);

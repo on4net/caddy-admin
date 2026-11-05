@@ -52,7 +52,15 @@ GitHub Actions: store the token as a secret and run the two `curl` calls in a st
 
 ## Docker management (admin only)
 
-Containers (start / stop / restart / remove, logs, details, live CPU+memory, **run new container** with ports/env/volumes/restart policy/network, pulls the image if missing), images (pull, remove, prune unused), volumes and networks. Talks to the Docker Engine API through the mounted socket (`DOCKER_SOCK_PATH` in `.env`).
+Containers (start / stop / restart / remove, details, live CPU+memory, **run new container** with ports/env/volumes/restart policy/network, pulls the image if missing), images (pull, remove, prune unused), volumes and networks. Talks to the Docker Engine API through the mounted socket (`DOCKER_SOCK_PATH` in `.env`).
+
+For **any** container (running or stopped), straight from the Docker table:
+
+- **Logs** - live follow (Server-Sent Events), tail size, text filter, wrap, "Download all" (streamed, any size). The browser keeps the last 5000 lines.
+- **Terminal** - a real interactive shell in the browser (`docker exec` with a TTY, xterm.js over a WebSocket): colours, vim/top, resize, optional user (`root`, `1000`...), shell `auto|sh|bash`. Closing the window ends the session; idle sessions end after `EXEC_IDLE_MIN` (default 30); max 10 sessions.
+- **Files** - the same file manager as for host folders (see below), pointed at the inside of a running container: *Files page -> Docker containers*, or the "Files" button in the table.
+
+Terminal and container files are shells/filesystem access as root inside the container: admin session only (API tokens can never use them), same-origin checked against cross-site WebSocket hijacking, every session and change is audited, and commands are passed as argument arrays (no shell string built from user input).
 
 > **Security:** access to `docker.sock` is root-equivalent on the host. That is why Docker, Files and Users are admin-only, every change is written to the audit log, the panel refuses to stop/remove its own container, and the panel should only be reachable over HTTPS (proxy host) or locally. The panel container runs as root with `pid: host` for this reason (docker socket, writing to mounted folders, host network counters).
 
@@ -62,7 +70,20 @@ CPU, memory, network throughput (↓/↑ per second + totals, per interface) and
 
 ## File manager (admin only)
 
-Browse, upload (streamed, size limit `MAX_UPLOAD_MB`, default 512), download, create folder, rename, delete - inside folders you mount from `.env`:
+One file manager for **two kinds of sources**: folders you mount from `.env` (the server) and the inside of any **running container**. Everything below works on both, and between them.
+
+| Feature | Details |
+|---|---|
+| Listing | Name, **size**, **created**, **modified**, permissions (+ owner in containers), sortable columns. *Created* shows `-` when the filesystem does not record it (BusyBox containers, some bind mounts) |
+| Create | New folder, new empty file |
+| View / edit | Text files (up to 2 MB) open in an editor with Save / Ctrl+S (owner and permissions are kept); images preview inline; PDFs open in a new tab; binary files offer Download. HTML is never rendered inline |
+| Upload | Files and whole **folders** (button or drag and drop), streamed with a progress bar, optional overwrite |
+| Download | Files, or folders as `.tar` |
+| Copy / Move | Select items -> Copy or Cut -> open any other folder, **even another source** (host <-> container, container <-> container) -> Paste. Folders keep permissions/symlinks; existing names are never overwritten; a folder cannot go into itself |
+| Zip / Unzip | Zip a selection into `name.zip`; unzip "here" or "into a new folder", optional overwrite. For containers the panel does the zipping, so the container needs no `zip`/`unzip` |
+| Rename / Delete | Multi-select delete with confirmation |
+
+Mount host folders in `.env` (up to **8**: `MOUNT_1_*` ... `MOUNT_8_*`, apply with `docker compose up -d`):
 
 ```
 MOUNT_1_PATH=/srv/data        # host folder (absolute path); empty = slot unused
@@ -70,7 +91,7 @@ MOUNT_1_NAME=Data             # label (default: folder name)
 MOUNT_1_MODE=rw               # rw | ro (default ro)
 ```
 
-Up to **8** folders (`MOUNT_1_*` ... `MOUNT_8_*`); apply with `docker compose up -d`. Each folder is a sandbox: `..` traversal and symlinks pointing outside are rejected, deleting/renaming a symlink acts on the link itself, read-only folders reject every change, and the folder root itself cannot be deleted. Running without Docker: `FILE_ROOTS="slug|Name|rw|/path,slug2|Name2|ro|/other"`.
+Safety: every folder is a sandbox (`..` and symlinks that point outside are rejected; deleting/renaming a symlink acts on the link itself); read-only folders reject every change; roots cannot be deleted. Archives are untrusted: **zip slip** (`../`, absolute names, symlink tricks), **zip/tar bombs** (`MAX_EXTRACT_MB`, default 4096; entry-count cap) and symlink entries are handled, and extraction never overwrites unless you tick overwrite. Container operations use argument arrays (no shell strings), need the container to be running, and its `ls`/`stat`/`mkdir`/`mv`/`cp`/`rm` (minimal images get an explanatory error). Files the panel creates in a container are `root:root 0644`; edits keep the original owner and mode. Large zip/unzip jobs stage in `DATA_DIR/tmp`. API: `/api/fm/*` with `src=host:<slug>` or `src=container:<id>` (admin session only; API tokens cannot use it). Running without Docker: `FILE_ROOTS="slug|Name|rw|/path,slug2|Name2|ro|/other"`.
 
 ## Run without Docker
 
