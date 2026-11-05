@@ -9,7 +9,7 @@ function h(tag, attrs, ...kids) {
     else if (v === true) el.setAttribute(k, '');
     else if (v !== false && v != null) el.setAttribute(k, v);
   }
-  for (const k of kids.flat()) if (k != null && k !== false) el.append(k.nodeType ? k : document.createTextNode(String(k)));
+  for (const k of kids.flat(Infinity)) if (k != null && k !== false) el.append(k.nodeType ? k : document.createTextNode(String(k)));
   return el;
 }
 
@@ -52,7 +52,7 @@ async function render() {
   const main = h('main');
   $app.replaceChildren(
     h('header', null, h('b', null, 'Caddy Admin'), nav,
-      h('span', { class: 'mut' }, state.user.email),
+      h('span', { class: 'mut who' }, state.user.email),
       h('button', { onclick: async () => { await api('POST', '/logout'); state.user = null; render(); } }, 'Logout')),
     main);
   try { await pages[state.page][1](main); } catch (e) { main.replaceChildren(flash('err', e.message)); }
@@ -1048,5 +1048,28 @@ async function panelDomainCard() {
     p.domain && h('button', { type: 'button', class: 'bad', onclick: () => confirmDo('Remove the panel domain? The panel stays reachable on its local address.', async () => { try { await api('DELETE', '/settings/panel-domain'); render(); } catch (err) { toast(msg, 'err', err.message); } }) }, 'Remove domain')),
   status);
 }
+
+// ---- responsive tables: label every cell with its column header; below 720px the CSS turns rows into cards
+function labelTables(root) {
+  for (const t of root.querySelectorAll('table')) {
+    const heads = [...t.querySelectorAll('thead th')].map((x) => x.textContent.replace(/[▲▼]/g, '').trim());
+    if (!heads.length) continue;
+    t.classList.add('cards');
+    for (const tr of t.querySelectorAll('tbody tr')) {
+      let i = 0;
+      for (const td of tr.children) {
+        td.dataset.label = td.colSpan > 1 ? '' : (heads[i] ?? ''); i += td.colSpan || 1;
+        // several siblings in one cell (name + badge...) would become separate flex items in card mode: keep them together
+        if (td.childNodes.length > 1 && !td.classList.contains('row') && td.colSpan === 1 && !(td.firstElementChild?.classList.contains('cell') && td.childNodes.length === 1)) {
+          const box = document.createElement('div'); box.className = 'cell';
+          box.append(...td.childNodes); td.append(box);
+        }
+      }
+    }
+  }
+}
+let labelTimer = null;
+new MutationObserver(() => { clearTimeout(labelTimer); labelTimer = setTimeout(() => labelTables(document.body), 30); })
+  .observe(document.body, { childList: true, subtree: true });
 
 render();

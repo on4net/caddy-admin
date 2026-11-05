@@ -51,3 +51,39 @@ textarea.editor{width:100%;min-height:55vh;font:13px/1.45 ui-monospace,Consolas,
 td .row.wrap{flex-wrap:wrap}
 tr.info td{border-bottom:none;padding-bottom:.15rem}
 tr.actions td{padding-top:.15rem}
+
+/* ---------- phones / narrow windows ---------- */
+@media (max-width:720px){
+  header{padding:.5rem .8rem;gap:.35rem .6rem}
+  header nav{order:3;flex:0 0 100%;flex-wrap:nowrap;overflow-x:auto;padding-bottom:.25rem;scrollbar-width:thin}
+  nav a{white-space:nowrap;padding:.4rem .75rem}
+  header .who{display:none}
+  header b{flex:1}
+  main{margin:.8rem auto;padding:0 .6rem}
+  .card{padding:.8rem}
+  .row.sp{gap:.6rem}
+  h2{font-size:1.05rem}
+  dialog{width:96vw;padding:.9rem}
+  dialog.wide,dialog.termdlg{width:97vw}
+  .term{height:55vh}
+  pre.logs{max-height:60vh}
+  textarea.editor{min-height:45vh}
+  .stat{min-width:0}
+
+  /* tables -> one card per row, each cell labelled with its column */
+  table.cards thead{display:none}
+  table.cards,table.cards tbody{display:block;width:100%}
+  table.cards tr{display:block;border:1px solid var(--line);border-radius:8px;margin:.5rem 0;padding:.35rem .65rem}
+  table.cards td{display:flex;justify-content:space-between;align-items:center;gap:.8rem;border:none;padding:.22rem 0;text-align:right;min-width:0;word-break:break-word}
+  table.cards td::before{content:attr(data-label);flex:0 0 5.5rem;text-align:left;color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.02em}
+  table.cards td[data-label=""]::before{display:none}
+  table.cards td[data-label=""]{justify-content:flex-start;text-align:left}
+  table.cards td[colspan]{display:block}
+  table.cards td>.row,table.cards td .row{justify-content:flex-start}
+  table.cards tr.info{margin-bottom:0;border-bottom:none;border-radius:8px 8px 0 0;padding-bottom:0}
+  table.cards tr.actions{margin-top:0;border-top:none;border-radius:0 0 8px 8px;padding-top:.1rem}
+  table.cards tr.actions td{display:block}
+  /* the file list is long: hide the rarely needed columns on a phone */
+  table.cards td[data-label="Created"],table.cards td[data-label="Permissions"]{display:none}
+}
+@media (max-width:720px){ table.cards td>.cell{min-width:0;text-align:right} }
