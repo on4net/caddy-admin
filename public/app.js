@@ -32,6 +32,14 @@ const pages = {
   users: ['Users', usersPage, true], settings: ['Settings', settingsPage],
 };
 
+/** Small message in the bottom corner: seen wherever the page is scrolled, never moves the layout. */
+function notify(kind, text) {
+  let box = document.getElementById('toasts');
+  if (!box) { box = h('div', { id: 'toasts' }); document.body.append(box); }
+  const t = h('div', { class: `toast ${kind}`, title: 'Click to dismiss', onclick: () => t.remove() }, text);
+  box.append(t);
+  setTimeout(() => t.remove(), kind === 'err' ? 10_000 : 4_500);
+}
 const flash = (kind, text) => h('div', { class: `msg ${kind}` }, text);
 const fmtDate = (s) => (s ? s.slice(0, 10) : '-');
 const toast = (box, kind, text) => { box.replaceChildren(flash(kind, text)); };
@@ -39,6 +47,7 @@ const applyNote = (r) => (r.applied === false ? `Saved, but Caddy was not update
 
 async function render() {
   clearInterval(state.timer);
+  state.soft = null;
   if (!state.user) {
     try { state.user = await api('GET', '/me'); }
     catch {
@@ -171,6 +180,47 @@ function confirmDo(text, fn) {
     h('button', { class: 'bad', onclick: () => { d.close(); fn(); } }, 'Yes'), h('button', { onclick: () => d.close() }, 'Cancel'))));
 }
 
+// ---------- add a custom SSL certificate in a modal (used from the host dialog and the panel-domain card) ----------
+function certUploadDialog(onDone) {
+  const err = h('div');
+  const name = h('input', { required: true, placeholder: 'e.g. wildcard-example-com' });
+  const cert = h('textarea', { required: true, placeholder: '-----BEGIN CERTIFICATE-----   (certificate, plus intermediates if you have them)' });
+  const key = h('textarea', { required: true, placeholder: '-----BEGIN PRIVATE KEY-----   (unencrypted)' });
+  const fromFile = (ta, label) => h('label', { class: 'mut', style: 'display:block;margin:.3rem 0 0' }, `or load ${label} from a file: `,
+    h('input', { type: 'file', accept: '.pem,.crt,.cer,.key,.txt', style: 'width:auto;display:inline-block;padding:.2rem', onchange: async (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      ta.value = await f.text();
+      if (!name.value) name.value = f.name.replace(/\.[^.]+$/, '');
+    } }));
+  const btn = h('button', { class: 'pri' }, 'Add certificate');
+  const d = dialog('Add SSL certificate', h('form', {
+    onsubmit: async (e) => {
+      e.preventDefault(); btn.disabled = true;
+      try { const c = await api('POST', '/certificates', { name: name.value, certificate: cert.value, private_key: key.value }); d.close(); onDone(c); }
+      catch (e2) { btn.disabled = false; toast(err, 'err', e2.message); }
+    },
+  }, err, h('p', { class: 'mut' }, 'Paste the PEM text or load the files. The private key must match the certificate and must not be password-protected. The certificate has to cover the host\'s domain (wildcards like *.example.com are fine).'),
+  h('label', null, 'Name'), name,
+  h('label', null, 'Certificate (PEM)'), cert, fromFile(cert, 'the certificate'),
+  h('label', null, 'Private key (PEM)'), key, fromFile(key, 'the key'),
+  h('div', { class: 'row', style: 'margin-top:1rem' }, btn, h('button', { type: 'button', onclick: () => d.close() }, 'Cancel'))));
+  d.classList.add('wide');
+  name.focus();
+}
+
+/** A <select> of certificates + an "Add certificate" button that opens the modal and selects the new one. */
+function certPicker(certs, selectedId) {
+  const sel = h('select');
+  const fill = (id) => {
+    sel.replaceChildren(...certs.map((c) => h('option', { value: c.id, selected: c.id === id }, `${c.name} (${c.domains.join(', ')})`)));
+    if (!certs.length) sel.append(h('option', { value: '' }, '- no certificates yet -'));
+  };
+  const add = () => certUploadDialog((c) => { certs.push(c); fill(c.id); });
+  fill(selectedId);
+  const box = h('div', null, h('label', null, 'Certificate'), h('div', { class: 'row' }, h('div', { style: 'flex:1;min-width:200px' }, sel), h('button', { type: 'button', onclick: add }, '+ Add certificate')));
+  return { sel, box, add, count: () => certs.length };
+}
+
 function hostDialog(x, certs, act) {
   const v = x || { domains: [], forward_scheme: 'http', forward_host: '', forward_port: 80, ssl_mode: 'none', force_ssl: 0, hsts: 0, skip_upstream_verify: 0, enabled: 1 };
   const err = h('div');
@@ -181,17 +231,17 @@ function hostDialog(x, certs, act) {
     port: h('input', { type: 'number', min: 1, max: 65535, value: v.forward_port, required: true }),
     ssl: h('select', null, [['none', 'None (HTTP only)'], ['letsencrypt', "Let's Encrypt (auto, renews itself)"], ['internal', 'Internal CA (self-signed, for LAN)'], ['custom', 'Custom certificate']]
       .map(([k, t]) => h('option', { value: k, selected: v.ssl_mode === k }, t))),
-    cert: h('select', null, certs.map((c) => h('option', { value: c.id, selected: v.certificate_id === c.id }, `${c.name} (${c.domains.join(', ')})`))),
     force: h('input', { type: 'checkbox', checked: !!v.force_ssl }), hsts: h('input', { type: 'checkbox', checked: !!v.hsts }),
     skip: h('input', { type: 'checkbox', checked: !!v.skip_upstream_verify }),
   };
+  const picker = certPicker(certs, v.certificate_id); f.cert = picker.sel;
   const sslOnly = h('div'); const certRow = h('div');
   const sync = () => {
     sslOnly.hidden = f.ssl.value === 'none'; certRow.hidden = f.ssl.value !== 'custom';
   };
-  f.ssl.addEventListener('change', sync);
+  f.ssl.addEventListener('change', () => { sync(); if (f.ssl.value === 'custom' && !picker.count()) picker.add(); }); // nothing to pick yet: open the upload modal right away
   sslOnly.append(h('label', { class: 'ck' }, f.force, 'Force SSL (redirect HTTP to HTTPS)'), h('label', { class: 'ck' }, f.hsts, 'HSTS'));
-  certRow.append(h('label', null, 'Certificate'), f.cert, certs.length ? '' : h('div', { class: 'mut' }, 'Upload a certificate first (SSL Certificates tab).'));
+  certRow.append(picker.box);
   const d = dialog(x ? 'Edit host' : 'Add host', h('form', {
     onsubmit: async (e) => {
       e.preventDefault();
@@ -200,11 +250,12 @@ function hostDialog(x, certs, act) {
         ssl_mode: f.ssl.value, certificate_id: f.ssl.value === 'custom' ? Number(f.cert.value) : null,
         force_ssl: f.force.checked, hsts: f.hsts.checked, skip_upstream_verify: f.skip.checked, enabled: v.enabled === 1,
       };
-      try { d.close(); await act(() => api(x ? 'PUT' : 'POST', x ? `/hosts/${x.id}` : '/hosts', body)); }
+      try { const r = await api(x ? 'PUT' : 'POST', x ? `/hosts/${x.id}` : '/hosts', body); d.close(); await act(async () => r); } // stay open on errors, so nothing typed is lost
       catch (e2) { toast(err, 'err', e2.message); }
     },
   }, err, h('label', null, 'Domain names (comma separated)'), f.domains,
   h('div', { class: 'grid' }, h('div', null, h('label', null, 'Scheme'), f.scheme), h('div', null, h('label', null, 'Forward host'), f.host), h('div', null, h('label', null, 'Port'), f.port)),
+  h('p', { class: 'mut', style: 'margin:.3rem 0' }, 'WebSockets (ws:// and wss://), Server-Sent Events and gRPC pass through automatically - there is nothing to enable.'),
   h('label', { class: 'ck' }, f.skip, 'Skip upstream certificate verification (https upstream, self-signed)'),
   h('label', null, 'SSL'), f.ssl, certRow, sslOnly,
   h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { class: 'pri' }, 'Save'), h('button', { type: 'button', onclick: () => d.close() }, 'Cancel'))));
@@ -382,40 +433,140 @@ async function dockerPage(main) {
 
 const stateBadge = (st) => h('span', { class: `badge ${st === 'running' ? 'ok' : st === 'exited' || st === 'dead' ? 'bad' : 'warn'}` }, st);
 
+// ======================= Docker containers: search, filter, sort, and refresh without losing your place =======================
+const STATE_RANK = { running: 0, restarting: 1, paused: 2, created: 3, exited: 4, dead: 5 };
+const dockerStats = { at: 0, byId: {} }; // CPU/memory cache, so redrawing the list never waits for the (slow) stats call
+const DOCKER_UI_DEFAULTS = { q: '', status: 'all', stack: '', net: '', sort: 'name', dir: 1, auto: false };
+const loadDockerUI = () => { try { return { ...DOCKER_UI_DEFAULTS, ...JSON.parse(localStorage.getItem('caddyadmin.docker') || '{}') }; } catch { return { ...DOCKER_UI_DEFAULTS }; } };
+const saveDockerUI = (ui) => { try { localStorage.setItem('caddyadmin.docker', JSON.stringify(ui)); } catch { /* private mode: keep it in memory only */ } };
+/** Refresh whatever list is on screen in place (falls back to a full render when there is none). */
+const soft = () => (state.soft ? state.soft() : render());
+
 async function dockerContainers(body) {
-  const list = await api('GET', '/docker/containers');
-  const msg = h('div');
-  const run = async (fn) => { try { await fn(); await render(); } catch (e) { toast(msg, 'err', e.message); } };
-  const cells = {};
-  body.replaceChildren(h('div', { class: 'card' },
-    h('div', { class: 'row sp' }, h('h2', null, 'Containers'), h('button', { class: 'pri', onclick: () => runDialog() }, '+ Run container')), msg,
-    h('div', { class: 'tw' }, h('table', null, th(['Name', 'Image', 'State', 'CPU / Mem', 'Ports', 'Networks']),
-      h('tbody', null, list.map((c) => {
-        const live = h('td', { class: 'mut' }, c.state === 'running' ? '...' : '-'); cells[c.id] = live;
-        return [h('tr', { class: 'info' },
-          h('td', null, h('b', null, c.name), c.self && h('span', { class: 'badge' }, 'this panel'), h('div', { class: 'mut' }, c.project ? `stack: ${c.project}` : c.id)),
-          h('td', null, c.image), h('td', null, stateBadge(c.state), h('div', { class: 'mut' }, c.status)), live, h('td', null, c.ports || '-'),
-          h('td', null, c.networkInfo?.length ? c.networkInfo.map((n) => h('div', null, h('span', { class: 'badge' }, n.name), n.ip && h('span', { class: 'mut' }, ' ' + n.ip))) : '-')),
-        // actions get their own full-width row, so they never get squeezed or pushed off-screen
-        h('tr', { class: 'actions' }, h('td', { colspan: 6 }, h('div', { class: 'row wrap' },
-            c.state !== 'running' && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/start`)) }, 'Start'),
-            c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/stop`)) }, 'Stop'),
-            c.state === 'running' && !c.self && h('button', { onclick: () => run(() => api('POST', `/docker/containers/${c.id}/restart`)) }, 'Restart'),
-            h('button', { onclick: () => logsDialog(c) }, 'Logs'),
-            c.state === 'running' && h('button', { onclick: () => terminalDialog(c) }, 'Terminal'),
-            c.state === 'running' && h('button', { onclick: () => { state.files = { src: 'container:' + c.id, path: '/', lastContainer: 'container:' + c.id }; state.page = 'files'; render(); } }, 'Files'),
-            h('button', { onclick: () => networksDialog(c) }, 'Networks'),
-            h('button', { onclick: () => updateDialog(c) }, 'Pull / Update'),
-            h('button', { onclick: () => detailsDialog(c) }, 'Details'),
-            !c.self && h('button', { class: 'bad', onclick: () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => run(() => api('DELETE', `/docker/containers/${c.id}?force=1`))) }, 'Remove'))))];
-      }),
-      list.length === 0 && empty(6, 'No containers.'))))));
-  // live stats are slow (~1s each, parallel): fill in after the list is on screen
-  api('GET', '/docker/containers/stats').then((st) => {
+  const ui = (state.dockerUI ||= loadDockerUI());
+  let list = await api('GET', '/docker/containers');
+  const busy = new Set(), cells = {};
+  let flashId = null;
+  const say = notify;
+
+  // ---- toolbar (built once: typing keeps focus while the rows below are redrawn)
+  const q = h('input', { type: 'search', placeholder: 'Search name, image, stack, port, network, IP...', value: ui.q, style: 'flex:2;min-width:220px' });
+  const selState = h('select', null, [['all', 'All states'], ['running', 'Running'], ['stopped', 'Stopped / exited'], ['other', 'Other']].map(([v, t]) => h('option', { value: v, selected: ui.status === v }, t)));
+  const selStack = h('select'), selNet = h('select');
+  const selSort = h('select', null, [['name', 'Sort: name'], ['state', 'Sort: state'], ['image', 'Sort: image'], ['stack', 'Sort: stack'], ['cpu', 'Sort: CPU'], ['mem', 'Sort: memory']].map(([v, t]) => h('option', { value: v, selected: ui.sort === v }, t)));
+  const dirBtn = h('button', { title: 'Reverse the order' });
+  const auto = h('input', { type: 'checkbox', checked: ui.auto });
+  const count = h('span', { class: 'mut' });
+  const tbody = h('tbody');
+  const SORT_COLS = [['Name', 'name'], ['Image', 'image'], ['State', 'state'], ['CPU / Mem', 'cpu']];
+  const sortTh = ([label, key]) => h('th', { class: 'sort', onclick: () => { ui.dir = ui.sort === key ? -ui.dir : 1; ui.sort = key; selSort.value = key; change(); } }, label);
+  const thead = h('thead', null, h('tr', null, ...SORT_COLS.map(sortTh), h('th', null, 'Ports'), h('th', null, 'Networks')));
+  const syncHead = () => [...thead.querySelectorAll('th.sort')].forEach((th, i) => { th.textContent = SORT_COLS[i][0] + (ui.sort === SORT_COLS[i][1] ? (ui.dir > 0 ? ' ▲' : ' ▼') : ''); }); // arrow follows the dropdown too
+
+  const options = (el, first, values, current) => {
+    el.replaceChildren(...first.map(([v, t]) => h('option', { value: v }, t)), ...values.map((v) => h('option', { value: v }, v)));
+    el.value = [...el.options].some((o) => o.value === current) ? current : '';
+  };
+  const fillOptions = () => {
+    const stacks = [...new Set(list.map((c) => c.project).filter(Boolean))].sort(), nets = [...new Set(list.flatMap((c) => c.networks))].sort();
+    options(selStack, [['', 'All stacks'], ['__none', '(no stack)']], stacks, ui.stack); ui.stack = selStack.value;
+    options(selNet, [['', 'All networks']], nets, ui.net); ui.net = selNet.value;
+  };
+
+  const hay = (c) => (c._hay ||= [c.name, c.image, c.id, c.project, c.state, c.status, c.ports, ...(c.networkInfo || []).flatMap((n) => [n.name, n.ip])].join(' ').toLowerCase());
+  const visible = () => {
+    const tokens = ui.q.toLowerCase().split(/\s+/).filter(Boolean);
+    const rows = list.filter((c) => {
+      if (ui.status === 'running' && c.state !== 'running') return false;
+      if (ui.status === 'stopped' && !['exited', 'dead', 'created'].includes(c.state)) return false;
+      if (ui.status === 'other' && ['running', 'exited', 'dead', 'created'].includes(c.state)) return false;
+      if (ui.stack === '__none' ? c.project : ui.stack && c.project !== ui.stack) return false;
+      if (ui.net && !c.networks.includes(ui.net)) return false;
+      const h2 = hay(c); return tokens.every((t) => h2.includes(t)); // every word must match somewhere
+    });
+    const val = { name: (c) => c.name.toLowerCase(), image: (c) => c.image.toLowerCase(), stack: (c) => c.project.toLowerCase() || '￿',
+      state: (c) => STATE_RANK[c.state] ?? 9, cpu: (c) => dockerStats.byId[c.id]?.cpu ?? -1, mem: (c) => dockerStats.byId[c.id]?.memUsed ?? -1 }[ui.sort];
+    return rows.sort((a, b) => { const x = val(a), y = val(b); return (x < y ? -1 : x > y ? 1 : a.name.localeCompare(b.name)) * ui.dir; });
+  };
+
+  const paintStats = () => {
     for (const [id, td] of Object.entries(cells)) {
-      const s = st[id]; if (s) td.replaceChildren(`${s.cpu}% / ${bytes(s.memUsed)}${s.memLimit ? ` of ${bytes(s.memLimit)}` : ''}`);
+      const s = dockerStats.byId[id];
+      if (s) td.replaceChildren(`${s.cpu}% / ${bytes(s.memUsed)}${s.memLimit ? ` of ${bytes(s.memLimit)}` : ''}`);
     }
-  }).catch(() => {});
+  };
+  const refreshStats = async (force) => {
+    if (!force && Date.now() - dockerStats.at < 20_000) return; // slow call: at most every 20 s
+    dockerStats.at = Date.now();
+    try { dockerStats.byId = await api('GET', '/docker/containers/stats'); paintStats(); if (['cpu', 'mem'].includes(ui.sort)) drawRows(); } catch { /* optional */ }
+  };
+
+  // ---- one action on one container: only that row shows progress, then only the list is re-read
+  const act = async (c, verb, fn) => {
+    busy.add(c.id); drawRows();
+    try { await fn(); say('ok', `${verb}: ${c.name}`); flashId = c.id; }
+    catch (e) { say('err', `${c.name}: ${e.message}`); }
+    busy.delete(c.id); await reload();
+  };
+  const post = (c, a) => api('POST', `/docker/containers/${c.id}/${a}`);
+
+  const rowsFor = (c) => {
+    const live = h('td', { class: 'mut' }, c.state === 'running' ? '...' : '-'); cells[c.id] = live;
+    const off = busy.has(c.id), cls = `${flashId === c.id ? 'flash' : ''} ${off ? 'busy' : ''}`;
+    const btn = (label, fn, extra = {}) => h('button', { disabled: off, onclick: fn, ...extra }, label);
+    return [
+      h('tr', { class: `info ${cls}` },
+        h('td', null, h('b', null, c.name), c.self && h('span', { class: 'badge' }, 'this panel'), h('div', { class: 'mut' }, c.project ? `stack: ${c.project}` : c.id)),
+        h('td', null, c.image), h('td', null, stateBadge(c.state), h('div', { class: 'mut' }, off ? 'working...' : c.status)), live, h('td', null, c.ports || '-'),
+        h('td', null, c.networkInfo?.length ? c.networkInfo.map((n) => h('div', null, h('span', { class: 'badge' }, n.name), n.ip && h('span', { class: 'mut' }, ' ' + n.ip))) : '-')),
+      // actions get their own full-width row, so they never get squeezed or pushed off-screen
+      h('tr', { class: `actions ${cls}` }, h('td', { colspan: 6 }, h('div', { class: 'row wrap' },
+        c.state !== 'running' && btn('Start', () => act(c, 'Started', () => post(c, 'start'))),
+        c.state === 'running' && !c.self && btn('Stop', () => act(c, 'Stopped', () => post(c, 'stop'))),
+        c.state === 'running' && !c.self && btn('Restart', () => act(c, 'Restarted', () => post(c, 'restart'))),
+        btn('Logs', () => logsDialog(c)),
+        c.state === 'running' && btn('Terminal', () => terminalDialog(c)),
+        c.state === 'running' && btn('Files', () => { state.files = { src: 'container:' + c.id, path: '/', lastContainer: 'container:' + c.id }; state.page = 'files'; render(); }),
+        btn('Networks', () => networksDialog(c)), btn('Pull / Update', () => updateDialog(c)), btn('Details', () => detailsDialog(c)),
+        !c.self && btn('Remove', () => confirmDo(`Remove container ${c.name}? (forces stop if running)`, () => act(c, 'Removed', () => api('DELETE', `/docker/containers/${c.id}?force=1`))), { class: 'bad' })))),
+    ];
+  };
+
+  const drawRows = () => {
+    for (const k of Object.keys(cells)) delete cells[k];
+    const rows = visible();
+    tbody.replaceChildren(...[...rows.flatMap(rowsFor), rows.length === 0 && empty(6, list.length ? 'No container matches the search / filters.' : 'No containers.')].filter(Boolean));
+    const running = list.filter((c) => c.state === 'running').length;
+    count.textContent = `Showing ${rows.length} of ${list.length} - ${running} running`;
+    dirBtn.textContent = ui.dir > 0 ? 'A-Z ▲' : 'Z-A ▼';
+    paintStats();
+    syncHead();
+    if (flashId) setTimeout(() => { flashId = null; tbody.querySelectorAll('.flash').forEach((r) => r.classList.remove('flash')); }, 2000);
+  };
+  const reload = async () => {
+    try { list = await api('GET', '/docker/containers'); } catch (e) { say('err', e.message); }
+    fillOptions(); drawRows(); refreshStats(false);
+  };
+  state.soft = reload; // dialogs call soft() instead of re-rendering the whole page
+
+  // ---- wiring
+  let qTimer = null;
+  const change = () => { saveDockerUI(ui); drawRows(); };
+  q.addEventListener('input', () => { clearTimeout(qTimer); qTimer = setTimeout(() => { ui.q = q.value; change(); }, 120); });
+  selState.addEventListener('change', () => { ui.status = selState.value; change(); });
+  selStack.addEventListener('change', () => { ui.stack = selStack.value; change(); });
+  selNet.addEventListener('change', () => { ui.net = selNet.value; change(); });
+  selSort.addEventListener('change', () => { ui.sort = selSort.value; change(); if (['cpu', 'mem'].includes(ui.sort)) refreshStats(true); });
+  dirBtn.addEventListener('click', () => { ui.dir = -ui.dir; change(); });
+  const applyAuto = () => { clearInterval(state.timer); state.timer = ui.auto ? setInterval(() => reload(), 10_000) : null; };
+  auto.addEventListener('change', () => { ui.auto = auto.checked; saveDockerUI(ui); applyAuto(); });
+  fillOptions();
+  body.replaceChildren(h('div', { class: 'card' },
+    h('div', { class: 'row sp' }, h('h2', null, 'Containers'), h('button', { class: 'pri', onclick: () => runDialog() }, '+ Run container')),
+    h('div', { class: 'toolbar' }, q, selState, selStack, selNet, selSort, dirBtn, h('button', { onclick: () => reload() }, 'Refresh'), h('label', { class: 'ck', style: 'margin:0' }, auto, 'auto-refresh (10 s)')),
+    h('div', { class: 'row sp' }, count),
+    h('div', { class: 'tw' }, h('table', null, thead, tbody))));
+  drawRows(); applyAuto(); refreshStats(true);
 }
 
 function logsDialog(c) {
@@ -551,7 +702,7 @@ function runDialog() {
       e.preventDefault(); btn.disabled = true; toast(err, 'ok', 'Starting (pulls the image first if missing - can take a while)...');
       try {
         await api('POST', '/docker/containers', { image: f.image.value, name: f.name.value || undefined, ports: f.ports.value, env: f.env.value, volumes: f.volumes.value, restart: f.restart.value, network: f.network.value || undefined, command: f.command.value || undefined });
-        d.close(); render();
+        d.close(); soft();
       } catch (e2) { btn.disabled = false; toast(err, 'err', e2.message); }
     },
   }, err, h('div', { class: 'grid' }, h('div', null, h('label', null, 'Image'), f.image), h('div', null, h('label', null, 'Name'), f.name)),
@@ -589,7 +740,7 @@ async function dockerVolumes(body) {
 // ---------- networks of one container ----------
 async function networksDialog(c) {
   const body = h('div', { class: 'mut' }, 'Loading...');
-  const d = dialog(`Networks - ${c.name}`, h('div', null, body, h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
+  const d = dialog(`Networks - ${c.name}`, h('div', null, body, h('div', { class: 'row', style: 'margin-top:1rem' }, h('button', { onclick: () => d.close() }, 'Close'))), () => soft());
   d.classList.add('wide');
   const draw = async () => {
     try {
@@ -651,7 +802,7 @@ function updateDialog(c) {
     h('p', null, 'Image: ', h('b', null, c.image)),
     h('p', { class: 'mut' }, 'Pull downloads the newest image for this tag (saved registry credentials are used automatically: Docker -> Registries). Update then replaces the container with a new one that keeps its ports, environment, volumes, networks and restart policy. If the new container fails to start, the old one is restored. Data in volumes is kept; changes made inside the container\'s own filesystem are lost.'),
     c.self && flash('warn', 'This is the panel itself: pull the image here, then run "docker compose up -d" on the server to switch to it.'),
-    out, h('div', { class: 'row', style: 'margin-top:1rem' }, pull, !c.self && upd, !c.self && rec, h('button', { onclick: () => d.close() }, 'Close'))), () => render());
+    out, h('div', { class: 'row', style: 'margin-top:1rem' }, pull, !c.self && upd, !c.self && rec, h('button', { onclick: () => d.close() }, 'Close'))), () => soft());
   d.classList.add('wide');
 }
 
@@ -1018,13 +1169,13 @@ async function panelDomainCard() {
     domain: h('input', { value: p.domain, placeholder: 'panel.example.com', required: true }),
     ssl: h('select', null, [['letsencrypt', "Let's Encrypt (auto, public domain)"], ['internal', 'Internal CA (LAN)'], ['custom', 'Custom certificate'], ['none', 'No SSL (HTTP)']]
       .map(([k, t]) => h('option', { value: k, selected: p.ssl_mode === k }, t))),
-    cert: h('select', null, certs.map((c) => h('option', { value: c.id, selected: p.certificate_id === c.id }, `${c.name} (${c.domains.join(', ')})`))),
     force: h('input', { type: 'checkbox', checked: p.domain ? p.force_ssl : true }), hsts: h('input', { type: 'checkbox', checked: p.hsts }),
   };
-  const certRow = h('div', null, h('label', null, 'Certificate'), f.cert);
+  const picker = certPicker(certs, p.certificate_id); f.cert = picker.sel;
+  const certRow = picker.box;
   const sslOpts = h('div', null, h('label', { class: 'ck' }, f.force, 'Force SSL (redirect HTTP to HTTPS)'), h('label', { class: 'ck' }, f.hsts, 'HSTS'));
   const sync = () => { certRow.hidden = f.ssl.value !== 'custom'; sslOpts.hidden = f.ssl.value === 'none'; };
-  f.ssl.addEventListener('change', sync); sync();
+  f.ssl.addEventListener('change', () => { sync(); if (f.ssl.value === 'custom' && !picker.count()) picker.add(); }); sync();
   const checkSsl = async (wait) => {
     toast(status, 'ok', wait ? 'Waiting for the certificate (up to 2 min)...' : 'Checking...');
     try {

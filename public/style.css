@@ -87,3 +87,18 @@ tr.actions td{padding-top:.15rem}
   table.cards td[data-label="Created"],table.cards td[data-label="Permissions"]{display:none}
 }
 @media (max-width:720px){ table.cards td>.cell{min-width:0;text-align:right} }
+
+/* containers toolbar + calm feedback */
+.toolbar{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.6rem 0}
+.toolbar select{width:auto;max-width:200px}
+th.sort{cursor:pointer;user-select:none;white-space:nowrap}
+th.sort:hover{color:var(--fg)}
+tr.busy td{opacity:.55}
+@keyframes rowflash{from{background:rgba(31,157,99,.22)}to{background:transparent}}
+tr.flash td{animation:rowflash 1.8s ease-out}
+@media (max-width:720px){ .toolbar>*{flex:1 1 140px;max-width:none !important} .toolbar input[type=search]{flex-basis:100%} }
+
+#toasts{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:.4rem;z-index:2000;max-width:min(380px,92vw)}
+.toast{background:var(--card);color:var(--fg);border:1px solid var(--line);border-left:4px solid var(--pri);border-radius:8px;padding:.55rem .8rem;box-shadow:0 4px 18px rgba(0,0,0,.25);cursor:pointer;word-break:break-word}
+.toast.err{border-left-color:var(--bad)}
+.toast.warn{border-left-color:var(--warn)}

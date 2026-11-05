@@ -74,6 +74,8 @@ Containers (start / stop / restart / remove, details, live CPU+memory, **run new
 
 **Registries** - Docker tab -> *Registries*: save a login for a private registry (e.g. your Nexus). The daemon verifies it when you save; afterwards every pull of an image from that host (Images tab, Run container, container Pull/Update) uses it automatically. The password is encrypted (AES-256-GCM, key in `panel_data/secret.key`) and is only ever sent to the matching registry host, never to Docker Hub or look-alike hosts. Protect `panel_data/` - the key is next to the database.
 
+**Finding things and keeping your place** - the container list has a search box (every word must match name, image, stack, id, port, network or IP), filters for state / stack / network, and sorting by name, state, image, stack, CPU or memory (header click or the dropdown, with a reverse button). Your search/filter/sort are remembered. Actions (start, stop, restart, remove, network, update, run) do **not** reload the page: only that row shows "working...", then just the list is re-read in place, the scroll position and your search stay, and the result appears as a small toast in the corner. Optional auto-refresh every 10 s.
+
 For **any** container (running or stopped), straight from the Docker table:
 
 - **Logs** - live follow (Server-Sent Events), tail size, text filter, wrap, "Download all" (streamed, any size). The browser keeps the last 5000 lines.
@@ -138,7 +140,9 @@ Caddy must be running with its admin API reachable (default `http://127.0.0.1:20
 | None | HTTP only |
 | Let's Encrypt | Caddy's ACME issues + auto-renews. Set the account email in Settings. Needs DNS pointing at the server and ports 80/443 open |
 | Internal CA | Caddy's local CA (LAN / testing; not publicly trusted) |
-| Custom | Upload cert+key PEM (validated: key matches, not expired, covers the host's domains) |
+| Custom | Upload cert+key PEM (validated: key matches, not expired, covers the host's domains). Pick **Custom certificate** in the host dialog and a modal lets you paste the PEM or load the files without leaving the dialog; the new certificate is selected for you (same in Settings -> Panel domain) |
+
+**WebSockets** (ws:// and wss://), Server-Sent Events and gRPC need no setting: Caddy proxies them automatically (unlike nginx, which needs extra headers).
 
 Plus **Force SSL** (308 redirect HTTP→HTTPS), **HSTS**, and a live **SSL status** probe showing the certificate Caddy actually serves (issuer, expiry).
 
